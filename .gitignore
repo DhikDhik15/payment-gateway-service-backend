@@ -1,0 +1,36 @@
+# ── Binaries ──────────────────────────────────────────────────────────────────
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# ── Test artefacts ────────────────────────────────────────────────────────────
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# ── Go toolchain ──────────────────────────────────────────────────────────────
+vendor/
+
+# ── Environment & secrets ─────────────────────────────────────────────────────
+.env
+*.local
+
+# ── Editor / OS ───────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ── Docker ────────────────────────────────────────────────────────────────────
+docker-compose.override.yml
+
+# ── Generated docs ────────────────────────────────────────────────────────────
+swagger/docs.go
+swagger/swagger.json
+swagger/swagger.yaml

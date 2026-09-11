@@ -1,0 +1,75 @@
+services:
+
+  # ── Application ─────────────────────────────────────────────────────────────
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pay-gate-app
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      APP_NAME: payment-gateway
+      APP_ENV: development
+      APP_PORT: "8080"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USER: payment
+      DB_PASSWORD: payment
+      DB_NAME: payment_gateway
+      DB_SSLMODE: disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - pay-gate-net
+
+  # ── PostgreSQL ───────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: pay-gate-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: payment
+      POSTGRES_PASSWORD: payment
+      POSTGRES_DB: payment_gateway
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payment -d payment_gateway"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - pay-gate-net
+
+  # ── Migration runner (one-shot) ──────────────────────────────────────────────
+  migrate:
+    image: migrate/migrate:v4.18.1
+    container_name: pay-gate-migrate
+    volumes:
+      - ./migrations:/migrations
+    command:
+      - "-path=/migrations"
+      - "-database=postgres://payment:payment@postgres:5432/payment_gateway?sslmode=disable"
+      - "up"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - pay-gate-net
+    profiles:
+      - migrate
+
+volumes:
+  postgres_data:
+    name: pay-gate-postgres-data
+
+networks:
+  pay-gate-net:
+    name: pay-gate-network
+    driver: bridge
