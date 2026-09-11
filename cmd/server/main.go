@@ -13,6 +13,7 @@ import (
 
 	"github.com/dhikaarta/pay-gate-backend/internal/config"
 	"github.com/dhikaarta/pay-gate-backend/internal/handler"
+	"github.com/dhikaarta/pay-gate-backend/internal/middleware"
 	"github.com/dhikaarta/pay-gate-backend/pkg/database"
 	"github.com/gin-gonic/gin"
 )
@@ -80,8 +81,12 @@ func main() {
 
 	r := gin.New()
 
-	// Middleware: recovery + structured request logging.
+	// Middleware order matters:
+	//   1. Recovery    — catches panics before anything else runs
+	//   2. RequestID   — stamps every request so all subsequent logs/responses carry it
+	//   3. Logger      — logs after RequestID so the ID is available
 	r.Use(gin.Recovery())
+	r.Use(middleware.RequestID())
 	r.Use(requestLogger())
 
 	// -------------------------------------------------------------------------
@@ -136,7 +141,8 @@ func main() {
 }
 
 // requestLogger returns a Gin middleware that emits a structured log line for
-// every HTTP request.
+// every HTTP request. It must run after the RequestID middleware so the ID is
+// available in the context.
 func requestLogger() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		start := time.Now()
@@ -144,7 +150,12 @@ func requestLogger() gin.HandlerFunc {
 
 		c.Next()
 
+		// Retrieve request ID set by the RequestID middleware.
+		rid, _ := c.Get("request_id")
+		requestID, _ := rid.(string)
+
 		slog.Info("http request",
+			slog.String("request_id", requestID),
 			slog.String("method", c.Request.Method),
 			slog.String("path", path),
 			slog.Int("status", c.Writer.Status()),
