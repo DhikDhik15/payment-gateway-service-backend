@@ -16,7 +16,7 @@ MODULE        := github.com/dhikaarta/pay-gate-backend
 # Migration directory.
 MIGRATIONS    := migrations
 # Database URL — mirrors docker-compose env for local use.
-DB_URL        ?= postgres://payment:payment@localhost:5432/payment_gateway?sslmode=disable
+DB_URL        ?= postgres://payment:payment@localhost:5433/payment_gateway?sslmode=disable
 # Docker Compose project name.
 COMPOSE_FILE  := docker-compose.yml
 
@@ -33,6 +33,12 @@ run:
 build:
 	@mkdir -p bin
 	CGO_ENABLED=0 go build -ldflags="-w -s" -o $(BINARY) $(CMD)
+	@echo "Binary: $(BINARY)"
+
+## build-no-vcs: compile without VCS stamping (use when not in a git repo)
+build-no-vcs:
+	@mkdir -p bin
+	CGO_ENABLED=0 go build -buildvcs=false -ldflags="-w -s" -o $(BINARY) $(CMD)
 	@echo "Binary: $(BINARY)"
 
 ## test: run all unit tests

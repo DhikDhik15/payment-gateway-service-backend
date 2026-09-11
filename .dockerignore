@@ -1,0 +1,15 @@
+.git
+.env
+.env.local
+bin/
+*.test
+*.out
+coverage.txt
+.idea/
+.vscode/
+docker-compose.override.yml
+swagger/docs.go
+swagger/swagger.json
+swagger/swagger.yaml
+README.md
+docs/

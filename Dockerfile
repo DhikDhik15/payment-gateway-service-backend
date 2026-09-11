@@ -1,10 +1,13 @@
 # ── Stage 1: Builder ──────────────────────────────────────────────────────────
-FROM golang:1.24-alpine AS builder
+FROM golang:1.25-alpine AS builder
 
 # Install build dependencies.
 RUN apk add --no-cache git ca-certificates tzdata
 
 WORKDIR /app
+
+# Prevent Go from trying to download a newer toolchain at build time.
+ENV GOTOOLCHAIN=local
 
 # Copy dependency manifests first for better layer caching.
 COPY go.mod go.sum ./
