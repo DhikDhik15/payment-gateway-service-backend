@@ -14,6 +14,8 @@ import (
 	"github.com/dhikaarta/pay-gate-backend/internal/config"
 	"github.com/dhikaarta/pay-gate-backend/internal/handler"
 	"github.com/dhikaarta/pay-gate-backend/internal/middleware"
+	"github.com/dhikaarta/pay-gate-backend/internal/repository"
+	"github.com/dhikaarta/pay-gate-backend/internal/service"
 	"github.com/dhikaarta/pay-gate-backend/pkg/database"
 	"github.com/gin-gonic/gin"
 )
@@ -90,6 +92,13 @@ func main() {
 	r.Use(requestLogger())
 
 	// -------------------------------------------------------------------------
+	// Dependencies — Repositories, Services, Handlers
+	// -------------------------------------------------------------------------
+	merchantRepo    := repository.NewMerchantRepository(pool)
+	merchantSvc     := service.NewMerchantService(merchantRepo)
+	merchantHandler := handler.NewMerchantHandler(merchantSvc)
+
+	// -------------------------------------------------------------------------
 	// Routes — Health
 	// -------------------------------------------------------------------------
 	healthHandler := handler.NewHealthHandler(pool)
@@ -98,10 +107,24 @@ func main() {
 	r.GET("/health/ready", healthHandler.Ready)
 
 	// -------------------------------------------------------------------------
-	// Routes — API v1 (placeholder, filled in subsequent steps)
+	// Routes — API v1
 	// -------------------------------------------------------------------------
-	// v1 := r.Group("/api/v1")
-	// { ... }
+	v1 := r.Group("/api/v1")
+	{
+		// Merchant endpoints (no auth required — used to register and look up merchants)
+		merchants := v1.Group("/merchants")
+		{
+			merchants.POST("",      merchantHandler.Create)
+			merchants.GET("/:id",   merchantHandler.GetByID)
+		}
+
+		// Payment endpoints (auth required — added in Step 3)
+		payments := v1.Group("/payments")
+		payments.Use(middleware.Auth(merchantSvc))
+		{
+			_ = payments // placeholder — routes added in Step 3
+		}
+	}
 
 	// -------------------------------------------------------------------------
 	// HTTP Server with graceful shutdown
