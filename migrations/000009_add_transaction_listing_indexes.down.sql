@@ -1,0 +1,2 @@
+DROP INDEX IF EXISTS idx_transactions_merchant_status_created_at;
+DROP INDEX IF EXISTS idx_transactions_merchant_created_at;
