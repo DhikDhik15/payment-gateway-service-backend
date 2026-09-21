@@ -13,37 +13,27 @@ services:
       APP_NAME: payment-gateway
       APP_ENV: development
       APP_PORT: "8080"
-      DB_HOST: postgres
-      DB_PORT: "5432"
-      DB_USER: payment
-      DB_PASSWORD: payment
-      DB_NAME: payment_gateway
-      DB_SSLMODE: disable
+      DB_HOST: ${DB_HOST:-host.docker.internal}
+      DB_PORT: ${DB_PORT:-5432}
+      DB_USER: ${DB_USER:?DB_USER is required}
+      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
+      DB_NAME: ${DB_NAME:-payment_gateway}
+      DB_SSLMODE: ${DB_SSLMODE:-disable}
+      WEBHOOK_DELIVERY_ENABLED: "true"
+      WEBHOOK_REQUIRE_HTTPS: "false"
+      ADMIN_API_KEY: ${ADMIN_API_KEY:-}
+      SETTLEMENT_RECON_STALE_AFTER: ${SETTLEMENT_RECON_STALE_AFTER:-2m}
+      WEBHOOK_SECRET_ENCRYPTION_KEY: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      # Phase 8 — dashboard auth (never commit real secrets; pass via host .env)
+      AUTH_JWT_SECRET: ${AUTH_JWT_SECRET:-}
+      AUTH_ACCESS_TOKEN_TTL: ${AUTH_ACCESS_TOKEN_TTL:-15m}
+      AUTH_REFRESH_TOKEN_TTL: ${AUTH_REFRESH_TOKEN_TTL:-168h}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:5173}
     depends_on:
-      postgres:
-        condition: service_healthy
-    networks:
-      - pay-gate-net
-
-  # ── PostgreSQL ───────────────────────────────────────────────────────────────
-  postgres:
-    image: postgres:16-alpine
-    container_name: pay-gate-postgres
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: payment
-      POSTGRES_PASSWORD: payment
-      POSTGRES_DB: payment_gateway
-    ports:
-      - "5433:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U payment -d payment_gateway"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 20s
+      migrate:
+        condition: service_completed_successfully
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     networks:
       - pay-gate-net
 
@@ -55,19 +45,12 @@ services:
       - ./migrations:/migrations
     command:
       - "-path=/migrations"
-      - "-database=postgres://payment:payment@postgres:5432/payment_gateway?sslmode=disable"
+      - "-database=postgres://${DB_USER}:${DB_PASSWORD}@${DB_HOST:-host.docker.internal}:${DB_PORT:-5432}/${DB_NAME:-payment_gateway}?sslmode=${DB_SSLMODE:-disable}"
       - "up"
-    depends_on:
-      postgres:
-        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     networks:
       - pay-gate-net
-    profiles:
-      - migrate
-
-volumes:
-  postgres_data:
-    name: pay-gate-postgres-data
 
 networks:
   pay-gate-net:

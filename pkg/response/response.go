@@ -42,24 +42,61 @@ const ContextKey = "request_id"
 type ErrorCode string
 
 const (
-	CodeInvalidRequest        ErrorCode = "INVALID_REQUEST"
-	CodeValidationError       ErrorCode = "VALIDATION_ERROR"
-	CodeInvalidAmount         ErrorCode = "INVALID_AMOUNT"
-	CodeInvalidCurrency       ErrorCode = "INVALID_CURRENCY"
-	CodeInvalidPaymentMethod  ErrorCode = "INVALID_PAYMENT_METHOD"
-	CodeUnauthorized          ErrorCode = "UNAUTHORIZED"
-	CodeInvalidAPIKey         ErrorCode = "INVALID_API_KEY"
-	CodeMerchantInactive      ErrorCode = "MERCHANT_INACTIVE"
-	CodeForbidden             ErrorCode = "FORBIDDEN"
-	CodeResourceNotFound      ErrorCode = "RESOURCE_NOT_FOUND"
-	CodeMerchantNotFound      ErrorCode = "MERCHANT_NOT_FOUND"
-	CodeTransactionNotFound   ErrorCode = "TRANSACTION_NOT_FOUND"
+	CodeInvalidRequest          ErrorCode = "INVALID_REQUEST"
+	CodeValidationError         ErrorCode = "VALIDATION_ERROR"
+	CodeInvalidAmount           ErrorCode = "INVALID_AMOUNT"
+	CodeInvalidCurrency         ErrorCode = "INVALID_CURRENCY"
+	CodeInvalidPaymentMethod    ErrorCode = "INVALID_PAYMENT_METHOD"
+	CodeUnauthorized            ErrorCode = "UNAUTHORIZED"
+	CodeInvalidAPIKey           ErrorCode = "INVALID_API_KEY"
+	CodeMerchantInactive        ErrorCode = "MERCHANT_INACTIVE"
+	CodeForbidden               ErrorCode = "FORBIDDEN"
+	CodeResourceNotFound        ErrorCode = "RESOURCE_NOT_FOUND"
+	CodeMerchantNotFound        ErrorCode = "MERCHANT_NOT_FOUND"
+	CodeTransactionNotFound     ErrorCode = "TRANSACTION_NOT_FOUND"
 	CodeDuplicateOrder          ErrorCode = "DUPLICATE_ORDER"
 	CodeDuplicateMerchantCode   ErrorCode = "DUPLICATE_MERCHANT_CODE"
 	CodeInvalidTransactionState ErrorCode = "INVALID_TRANSACTION_STATE"
-	CodePaymentProviderError  ErrorCode = "PAYMENT_PROVIDER_ERROR"
-	CodePaymentProviderTimeout ErrorCode = "PAYMENT_PROVIDER_TIMEOUT"
-	CodeInternalError         ErrorCode = "INTERNAL_ERROR"
+	CodePaymentProviderError    ErrorCode = "PAYMENT_PROVIDER_ERROR"
+	CodePaymentProviderTimeout  ErrorCode = "PAYMENT_PROVIDER_TIMEOUT"
+	CodeInternalError           ErrorCode = "INTERNAL_ERROR"
+	CodeIdempotencyKeyReused    ErrorCode = "IDEMPOTENCY_KEY_REUSED"
+	CodeIdempotencyInProgress   ErrorCode = "IDEMPOTENCY_REQUEST_IN_PROGRESS"
+
+	// Refund error codes (Phase 7B).
+	CodeRefundNotFound           ErrorCode = "REFUND_NOT_FOUND"
+	CodeRefundNotAllowed         ErrorCode = "REFUND_NOT_ALLOWED"
+	CodeRefundAmountExceeded     ErrorCode = "REFUND_AMOUNT_EXCEEDED"
+	CodeRefundTransactionNotPaid ErrorCode = "REFUND_TRANSACTION_NOT_PAID"
+	CodeRefundCurrencyMismatch   ErrorCode = "REFUND_CURRENCY_MISMATCH"
+	CodeRefundProviderError      ErrorCode = "REFUND_PROVIDER_ERROR"
+	CodeRefundProviderTimeout    ErrorCode = "REFUND_PROVIDER_TIMEOUT"
+
+	// Settlement / reconciliation error codes (Phase 7C).
+	CodeSettlementNotFound             ErrorCode = "SETTLEMENT_NOT_FOUND"
+	CodeSettlementAlreadyExists        ErrorCode = "SETTLEMENT_ALREADY_EXISTS"
+	CodeSettlementImportInvalid        ErrorCode = "SETTLEMENT_IMPORT_INVALID"
+	CodeSettlementImportFailed         ErrorCode = "SETTLEMENT_IMPORT_FAILED"
+	CodeSettlementImportConflict       ErrorCode = "SETTLEMENT_IMPORT_CONFLICT"
+	CodeSettlementInvalidStatus        ErrorCode = "SETTLEMENT_INVALID_STATUS"
+	CodeSettlementReconciliationFailed ErrorCode = "SETTLEMENT_RECONCILIATION_FAILED"
+	CodeReconciliationNotFound         ErrorCode = "RECONCILIATION_NOT_FOUND"
+	CodeReconciliationAlreadyRunning   ErrorCode = "RECONCILIATION_ALREADY_RUNNING"
+	CodeReconciliationMismatch         ErrorCode = "RECONCILIATION_MISMATCH"
+	CodeAdminUnauthorized              ErrorCode = "ADMIN_UNAUTHORIZED"
+	CodeAdminNotConfigured             ErrorCode = "ADMIN_NOT_CONFIGURED"
+
+	// API key lifecycle error codes (Phase 5C).
+	CodeAPIKeyNotFound           ErrorCode = "API_KEY_NOT_FOUND"
+	CodeAPIKeyAlreadyRevoked     ErrorCode = "API_KEY_ALREADY_REVOKED"
+	CodeAPIKeyOwnershipViolation ErrorCode = "API_KEY_OWNERSHIP_VIOLATION"
+
+	// Dashboard auth error codes (Phase 8).
+	CodeInvalidCredentials    ErrorCode = "INVALID_CREDENTIALS"
+	CodeUserDisabled          ErrorCode = "USER_DISABLED"
+	CodeDashboardUserNotFound ErrorCode = "DASHBOARD_USER_NOT_FOUND"
+	CodeEmailAlreadyExists    ErrorCode = "EMAIL_ALREADY_EXISTS"
+	CodeInsufficientRole      ErrorCode = "INSUFFICIENT_ROLE"
 )
 
 // ─── Envelope types ──────────────────────────────────────────────────────────
@@ -75,9 +112,9 @@ type Meta struct {
 
 // successEnvelope is the JSON shape for all successful single-resource responses.
 type successEnvelope struct {
-	Success bool   `json:"success"`
-	Data    any    `json:"data"`
-	Meta    Meta   `json:"meta"`
+	Success bool `json:"success"`
+	Data    any  `json:"data"`
+	Meta    Meta `json:"meta"`
 }
 
 // errorDetail is the machine- and human-readable error payload.
@@ -200,6 +237,11 @@ func Conflict(c *gin.Context, code ErrorCode, message string) {
 	writeError(c, http.StatusConflict, code, message, nil)
 }
 
+// ConflictWithDetails writes HTTP 409 with a details payload.
+func ConflictWithDetails(c *gin.Context, code ErrorCode, message string, details any) {
+	writeError(c, http.StatusConflict, code, message, details)
+}
+
 // UnprocessableEntity writes HTTP 422.
 func UnprocessableEntity(c *gin.Context, code ErrorCode, message string, details any) {
 	writeError(c, http.StatusUnprocessableEntity, code, message, details)
@@ -215,13 +257,28 @@ func PaymentProviderError(c *gin.Context, message string) {
 	writeError(c, http.StatusBadGateway, CodePaymentProviderError, message, nil)
 }
 
+// BadGateway writes HTTP 502 with the given error code and message.
+func BadGateway(c *gin.Context, code ErrorCode, message string) {
+	writeError(c, http.StatusBadGateway, code, message, nil)
+}
+
 // PaymentProviderTimeout writes HTTP 504.
 func PaymentProviderTimeout(c *gin.Context) {
 	writeError(c, http.StatusGatewayTimeout, CodePaymentProviderTimeout, "Payment provider did not respond in time", nil)
+}
+
+// GatewayTimeout writes HTTP 504 with the given error code and message.
+func GatewayTimeout(c *gin.Context, code ErrorCode, message string) {
+	writeError(c, http.StatusGatewayTimeout, code, message, nil)
 }
 
 // InternalServerError writes HTTP 500.
 // The raw internal error is intentionally NOT forwarded to the client.
 func InternalServerError(c *gin.Context) {
 	writeError(c, http.StatusInternalServerError, CodeInternalError, "An unexpected error occurred", nil)
+}
+
+// ServiceUnavailable writes HTTP 503.
+func ServiceUnavailable(c *gin.Context, code ErrorCode, message string) {
+	writeError(c, http.StatusServiceUnavailable, code, message, nil)
 }
