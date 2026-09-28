@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 
+	"github.com/dhikaarta/pay-gate-backend/internal/audit"
 	"github.com/dhikaarta/pay-gate-backend/pkg/response"
 	"github.com/gin-gonic/gin"
 )
@@ -24,20 +25,29 @@ const (
 )
 
 // RequestID is a Gin middleware that:
-//  1. Reads X-Request-ID from the incoming request header.
-//  2. Generates a new ID (req_<16 random chars>) when none is provided.
+//  1. Reads and bounds X-Request-ID from the incoming request header.
+//  2. Generates a new ID (req_<16 random chars>) when none is provided or the
+//     supplied value is unsafe for logs/audit correlation.
 //  3. Stores the ID in the Gin context under response.ContextKey so that
 //     response helpers can embed it in every JSON envelope.
 //  4. Echoes the final ID back to the caller via the X-Request-ID response header.
 func RequestID() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		id := c.GetHeader(HeaderRequestID)
+		id := audit.NormalizeRequestID(c.GetHeader(HeaderRequestID))
 		if id == "" {
 			id = generateID()
 		}
 
 		// Make it available to downstream handlers and response helpers.
 		c.Set(response.ContextKey, id)
+
+		// Carry only the bounded correlation data needed by the security audit
+		// trail. ClientIP follows the application's existing trusted-proxy setup.
+		requestContext := audit.WithRequestMetadata(c.Request.Context(), audit.RequestMetadata{
+			RequestID: id,
+			IP:        c.ClientIP(),
+		})
+		c.Request = c.Request.WithContext(requestContext)
 
 		// Return it in the response header so clients can correlate requests.
 		c.Header(HeaderRequestID, id)

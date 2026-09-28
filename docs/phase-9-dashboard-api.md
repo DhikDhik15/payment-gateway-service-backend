@@ -4,7 +4,9 @@ This document is the authoritative contract for the React TypeScript dashboard
 resource APIs (Phase 9). Auth endpoints remain documented in
 [`phase-8-dashboard-auth-api.md`](./phase-8-dashboard-auth-api.md).
 
-**Base URL:** `http://localhost:8080` (production: configured by deployment)
+**Base URL:** `http://localhost:8081` when using the repository's Docker Compose
+bridge (`8081` maps to the container's `8080`); local non-Docker runs use
+`http://localhost:8080`. Production uses the configured HTTPS public origin.
 
 ---
 
@@ -64,6 +66,7 @@ Timestamps are **UTC RFC3339**.
 |---|---|---|---|
 | Overview | yes | yes | yes |
 | Payments read / detail | yes | yes | yes |
+| Create payment | yes | yes | **no** |
 | Refunds read | yes | yes | yes |
 | Create refund | yes | yes | **no** |
 | Webhook deliveries read | yes | yes | yes |
@@ -151,6 +154,26 @@ Insufficient role → `403 INSUFFICIENT_ROLE`.
 
 ---
 
+### POST /api/v1/dashboard/payments
+
+**Auth:** Bearer JWT
+**Roles:** OWNER, ADMIN (VIEWER → 403)
+
+**Headers:**
+
+| Header | Required |
+|---|---|
+| `Idempotency-Key` | yes (1–255 chars) |
+| `Content-Type` | `application/json` |
+
+Creates a payment for the authenticated user's merchant. The body and
+provider/idempotency semantics match the integration payment endpoint. In a
+production-mode deployment the configured non-mock provider is used; mock
+provider flows belong only to development/test environments. No provider
+credential or raw provider response is returned.
+
+---
+
 ### GET /api/v1/dashboard/payments/:payment_id
 
 **Auth:** Bearer JWT  
@@ -201,7 +224,7 @@ Cross-merchant → `404 REFUND_NOT_FOUND`.
 
 ### POST /api/v1/dashboard/payments/:payment_id/refunds
 
-**Auth:** Bearer JWT  
+**Auth:** Bearer JWT
 **Roles:** OWNER, ADMIN (VIEWER → 403)
 
 **Headers:**
@@ -218,7 +241,10 @@ Cross-merchant → `404 REFUND_NOT_FOUND`.
 ```
 
 Reuses existing `RefundService` (over-refund protection, FOR UPDATE, idempotency,
-provider call outside DB tx, finalize + outbox). Do not duplicate client-side.
+provider call outside DB tx, finalize + outbox). For a non-mock provider this
+route currently returns `503` before reserving a local refund because a real
+provider-specific refund adapter is not implemented. Do not duplicate the
+client-side flow or treat this endpoint as production-complete for Midtrans.
 
 ---
 

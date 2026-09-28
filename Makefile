@@ -2,9 +2,9 @@
 # Payment Gateway — Makefile
 # ──────────────────────────────────────────────────────────────────────────────
 
-.PHONY: all run build test fmt vet \
-        docker-up docker-down docker-build docker-logs \
-        migrate-up migrate-down migrate-create \
+.PHONY: all run build test test-integration fmt fmt-check vet \
+        docker-up docker-down docker-build docker-logs docker-validate \
+        migrate-up migrate-down migrate-status migrate-create \
         swagger lint clean help
 
 # Binary output path.
@@ -15,13 +15,17 @@ CMD           := ./cmd/server
 MODULE        := github.com/dhikaarta/pay-gate-backend
 # Migration directory.
 MIGRATIONS    := migrations
-# Database URL — mirrors docker-compose env for local use.
-DB_URL        ?= postgres://payment:payment@localhost:5433/payment_gateway?sslmode=disable
+# Database URL — explicitly supplied by the operator. Prefer DATABASE_URL for
+# deployments or TEST_DATABASE_URL for disposable integration tests; no
+# credential or port is embedded in the Makefile.
+DATABASE_URL  ?=
+TEST_DATABASE_URL ?=
+DB_URL        ?= $(if $(DATABASE_URL),$(DATABASE_URL),$(TEST_DATABASE_URL))
 # Docker Compose project name.
 COMPOSE_FILE  := docker-compose.yml
 
-## all: fmt + vet + test + build
-all: fmt vet test build
+## all: format check + vet + test + build (read-only for the source tree)
+all: fmt-check vet test build
 
 # ── Local development ─────────────────────────────────────────────────────────
 
@@ -41,13 +45,22 @@ build-no-vcs:
 	CGO_ENABLED=0 go build -buildvcs=false -ldflags="-w -s" -o $(BINARY) $(CMD)
 	@echo "Binary: $(BINARY)"
 
-## test: run all unit tests
+## test: run all unit/in-memory tests with the race detector
 test:
 	go test -v -race -count=1 ./...
+
+## test-integration: run the PostgreSQL-backed suite against a disposable DB
+test-integration:
+	@test -n "$(TEST_DATABASE_URL)" || (echo "TEST_DATABASE_URL is required"; exit 1)
+	TEST_DATABASE_URL="$(TEST_DATABASE_URL)" go test -v -race -count=1 -p=1 ./...
 
 ## fmt: format all Go source files
 fmt:
 	gofmt -w .
+
+## fmt-check: fail when Go source files need formatting
+fmt-check:
+	@test -z "$$(gofmt -l .)" || (echo "Go files need gofmt; run make fmt"; gofmt -l .; exit 1)
 
 ## vet: run go vet on all packages
 vet:
@@ -63,15 +76,19 @@ clean:
 
 # ── Docker ────────────────────────────────────────────────────────────────────
 
+## docker-validate: validate the Compose model without starting services
+docker-validate:
+	docker compose -f $(COMPOSE_FILE) config --quiet
+
 ## docker-build: build the Docker image
 docker-build:
 	docker compose -f $(COMPOSE_FILE) build
 
-## docker-up: start all services (app + postgres) in detached mode
+## docker-up: start the app and one-shot migration job (external PostgreSQL)
 docker-up:
 	docker compose -f $(COMPOSE_FILE) up -d --build
 
-## docker-down: stop and remove containers (volumes are preserved)
+## docker-down: stop and remove Compose containers (external DB is unaffected)
 docker-down:
 	docker compose -f $(COMPOSE_FILE) down
 
@@ -81,12 +98,20 @@ docker-logs:
 
 # ── Database migrations ───────────────────────────────────────────────────────
 
-## migrate-up: apply all pending migrations
+## migrate-up: apply all pending migrations (requires an explicit DB_URL)
 migrate-up:
+	@test -n "$(DB_URL)" || (echo "DB_URL or DATABASE_URL is required"; exit 1)
 	migrate -path $(MIGRATIONS) -database "$(DB_URL)" up
 
-## migrate-down: roll back the last applied migration
+## migrate-status: show the current migration version and dirty state
+migrate-status:
+	@test -n "$(DB_URL)" || (echo "DB_URL or DATABASE_URL is required"; exit 1)
+	migrate -path $(MIGRATIONS) -database "$(DB_URL)" version
+
+## migrate-down: explicitly roll back one migration (destructive; guarded)
 migrate-down:
+	@test "$(ALLOW_DESTRUCTIVE_DOWN)" = "true" || (echo "Refusing destructive migration rollback; set ALLOW_DESTRUCTIVE_DOWN=true after approval"; exit 1)
+	@test -n "$(DB_URL)" || (echo "DB_URL or DATABASE_URL is required"; exit 1)
 	migrate -path $(MIGRATIONS) -database "$(DB_URL)" down 1
 
 ## migrate-create name=<migration_name>: create a new migration pair

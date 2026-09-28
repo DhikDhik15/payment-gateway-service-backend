@@ -15,6 +15,10 @@ const (
 	defaultMaxConnLifetime = 5 * time.Minute
 	defaultMaxConnIdleTime = 1 * time.Minute
 	defaultConnectTimeout  = 10 * time.Second
+
+	// ExpectedMigrationVersion is the minimum clean schema version required
+	// by this release. Future compatible migrations may advance beyond it.
+	ExpectedMigrationVersion = 19
 )
 
 // NewPool creates and validates a new pgxpool connection pool.
@@ -55,4 +59,28 @@ func Ping(ctx context.Context, pool *pgxpool.Pool) error {
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	return pool.Ping(ctx)
+}
+
+// CheckSchema verifies that the database has a clean migration state at or
+// beyond the release's minimum supported version. A reachable database with a
+// missing, old, or dirty schema is not ready for application traffic.
+func CheckSchema(ctx context.Context, pool *pgxpool.Pool) error {
+	if pool == nil {
+		return fmt.Errorf("database pool is nil")
+	}
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	var version int
+	var dirty bool
+	if err := pool.QueryRow(ctx, `SELECT version, dirty FROM schema_migrations`).Scan(&version, &dirty); err != nil {
+		return fmt.Errorf("read schema migration state: %w", err)
+	}
+	if dirty {
+		return fmt.Errorf("database schema migration is dirty at version %d", version)
+	}
+	if version < ExpectedMigrationVersion {
+		return fmt.Errorf("database schema version %d is below required version %d", version, ExpectedMigrationVersion)
+	}
+	return nil
 }

@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -149,11 +150,22 @@ func (p *MidtransWebhookParser) ParseEvent(payload []byte) (*ParsedWebhookEvent,
 	if json.Unmarshal(payload, &v) != nil {
 		return nil, ErrWebhookMalformedPayload
 	}
-	if v.OrderID == "" || v.TransactionStatus == "" || v.StatusCode == "" {
+	if v.OrderID == "" || v.TransactionID == "" || v.TransactionStatus == "" || v.StatusCode == "" || strings.TrimSpace(v.GrossAmount) == "" || strings.TrimSpace(v.Currency) == "" {
 		return nil, ErrWebhookMissingFields
 	}
-	amount := int64(0)
-	fmt.Sscan(v.GrossAmount, &amount)
+	amount, err := strconv.ParseInt(strings.TrimSpace(v.GrossAmount), 10, 64)
+	if err != nil || amount <= 0 {
+		return nil, ErrWebhookMalformedPayload
+	}
+	currency := strings.ToUpper(strings.TrimSpace(v.Currency))
+	if len(currency) != 3 {
+		return nil, ErrWebhookMalformedPayload
+	}
+	for _, r := range currency {
+		if r < 'A' || r > 'Z' {
+			return nil, ErrWebhookMalformedPayload
+		}
+	}
 	status := strings.ToLower(v.TransactionStatus)
 	typ := "UNKNOWN"
 	switch status {
@@ -164,5 +176,5 @@ func (p *MidtransWebhookParser) ParseEvent(payload []byte) (*ParsedWebhookEvent,
 	case "expire":
 		typ = "PAYMENT_EXPIRED"
 	}
-	return &ParsedWebhookEvent{EventID: v.TransactionID + ":" + status + ":" + v.StatusCode, EventType: typ, ProviderTransactionID: v.OrderID, MerchantOrderID: v.OrderID, Status: status, Amount: amount, Currency: v.Currency}, nil
+	return &ParsedWebhookEvent{EventID: v.TransactionID + ":" + status + ":" + v.StatusCode, EventType: typ, ProviderTransactionID: v.OrderID, MerchantOrderID: v.OrderID, Status: status, Amount: amount, Currency: currency}, nil
 }

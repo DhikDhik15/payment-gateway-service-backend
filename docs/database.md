@@ -8,6 +8,12 @@ All tables use `UUID` primary keys generated server-side (`gen_random_uuid()`).
 All timestamps are `TIMESTAMP WITH TIME ZONE` stored in UTC.
 Monetary amounts are `BIGINT` (smallest currency unit — no floating point).
 
+Phase 8D.5 adds the append-only `audit_logs` table (migration `000018`) for
+security events. It stores tenant/actor/request/IP attribution and bounded,
+secret-safe JSONB metadata. Audit rows have no cascading business-row foreign
+keys, and the application repository has no update/delete operation. Retention
+is currently indefinite; see `docs/phase-8d5-security-audit.md`.
+
 ---
 
 ## Entity Relationship Diagram
@@ -33,9 +39,14 @@ merchants
 id          UUID PK
 name        VARCHAR(150) NOT NULL
 code        VARCHAR(50)  UNIQUE NOT NULL
-api_key     VARCHAR(255) UNIQUE NOT NULL
-api_secret  VARCHAR(255) NOT NULL        ← SHA-256 hash, never plain text
+api_key     VARCHAR(255) UNIQUE NULL      ← legacy key; NULL = none exists (8D.3)
+api_secret  VARCHAR(255) NULL             ← SHA-256 hash, never plain text
 status      VARCHAR(20)  NOT NULL        ← ACTIVE | INACTIVE | SUSPENDED
+legacy_credential_state
+            VARCHAR(20)  NOT NULL DEFAULT 'LEGACY'
+                                          ← LEGACY | MIGRATED | LEGACY_DISABLED (8D.3)
+legacy_credential_disabled_at
+            TIMESTAMPTZ NULL              ← set once, at first disable (8D.3)
 created_at  TIMESTAMPTZ NOT NULL
 updated_at  TIMESTAMPTZ NOT NULL
 
@@ -81,19 +92,30 @@ updated_at              TIMESTAMPTZ NOT NULL
 | id | UUID | NOT NULL | PK, server-generated |
 | name | VARCHAR(150) | NOT NULL | Display name |
 | code | VARCHAR(50) | NOT NULL | Short unique identifier |
-| api_key | VARCHAR(255) | NOT NULL | Public key `pk_<hex>`, used for auth |
-| api_secret | VARCHAR(255) | NOT NULL | SHA-256 of `sk_<hex>`, never returned via API |
+| api_key | VARCHAR(255) | **NULL allowed** (since 000017) | Legacy public key `pk_<hex>`. **NULL = no legacy credential exists.** Creation frozen in Phase 8D.3 |
+| api_secret | VARCHAR(255) | **NULL allowed** (since 000017) | SHA-256 of `sk_<hex>`, never returned via API. NULL whenever `api_key` is NULL |
 | status | VARCHAR(20) | NOT NULL | `ACTIVE` \| `INACTIVE` \| `SUSPENDED` |
+| legacy_credential_state | VARCHAR(20) | NOT NULL, default `'LEGACY'` | Phase 8D.3: `LEGACY` \| `MIGRATED` \| `LEGACY_DISABLED` (CHECK). Authoritative gate for legacy-key auth |
+| legacy_credential_disabled_at | TIMESTAMPTZ | NULL | Set **once**, when `LEGACY_DISABLED` is first reached |
 | created_at | TIMESTAMPTZ | NOT NULL | |
 | updated_at | TIMESTAMPTZ | NOT NULL | |
 
 **Indexes:**
 - `merchants_pkey` — PRIMARY KEY on `id`
 - `uq_merchants_code` — UNIQUE on `code`
-- `uq_merchants_api_key` — UNIQUE on `api_key`
+- `uq_merchants_api_key` — UNIQUE on `api_key` (PostgreSQL permits many `NULL`s)
 - `idx_merchants_api_key` — btree on `api_key` (fast auth lookup)
 
-**Check constraint:** `status IN ('ACTIVE', 'INACTIVE', 'SUSPENDED')`
+**Check constraints:**
+- `status IN ('ACTIVE', 'INACTIVE', 'SUSPENDED')`
+- `chk_merchants_legacy_credential_state` — `legacy_credential_state IN ('LEGACY', 'MIGRATED', 'LEGACY_DISABLED')`
+
+> `NOT NULL` on `api_key`/`api_secret` was dropped by migration `000017` so
+> tenants created after the Phase 8D.3 freeze can exist with **no** legacy
+> material (`api_key IS NULL`, state `MIGRATED`). Because a `NULL` key can
+> never match `WHERE api_key = $1`, such merchants are unreachable through
+> legacy auth regardless of state. See
+> [legacy-credentials.md](./legacy-credentials.md).
 
 ---
 
@@ -275,17 +297,38 @@ CANCELLED → any
 | `000011_create_merchant_webhook_deliveries.down.sql` | Drop merchant_webhook_deliveries |
 | `000012_refund_core.up.sql` | Add `refunded_amount` / `reserved_refund_amount` to transactions; create `refunds`, `refund_attempts`; extend `idempotency_keys` with `refund_id` |
 | `000012_refund_core.down.sql` | Reverse migration 12 |
+| `000013_create_settlements.up.sql` | Create `settlements` table |
+| `000013_create_settlements.down.sql` | Drop `settlements` |
+| `000014_create_merchant_users.up.sql` | Create `merchant_users` dashboard accounts |
+| `000014_create_merchant_users.down.sql` | Drop `merchant_users` |
+| `000015_create_merchant_user_invitations.up.sql` | Create `merchant_user_invitations` |
+| `000015_create_merchant_user_invitations.down.sql` | Drop `merchant_user_invitations` |
+| `000016_create_email_outbox.up.sql` | Create `email_outbox` |
+| `000016_create_email_outbox.down.sql` | Drop `email_outbox` |
+| `000017_legacy_credential_state.up.sql` | Phase 8D.3: drop `NOT NULL` from `merchants.api_key`/`api_secret`; add `legacy_credential_state` (CHECK, default `LEGACY`) and `legacy_credential_disabled_at` |
+| `000017_legacy_credential_state.down.sql` | Drop the two state columns and the CHECK (**`NOT NULL` is deliberately NOT restored** — credential-less merchants exist) |
+| `000018_create_audit_logs.up.sql` | Phase 8D.5: create append-only, tenant-aware `audit_logs` with bounded JSONB metadata and investigation indexes |
+| `000018_create_audit_logs.down.sql` | Drop `audit_logs` (retention is otherwise indefinite) |
 
-All migrations are reversible. `golang-migrate` tracks applied versions in
-the `schema_migrations` table.
+Migrations are tracked by `golang-migrate` in `schema_migrations`. The down
+scripts are not a substitute for an application rollback plan: several are
+destructive, and migration 17 intentionally does not restore the earlier
+`NOT NULL` constraints. Do not run a down migration automatically; require
+explicit approval and use a backup when schema restoration is necessary.
 
 ---
 
 ## Common Queries
 
 ```sql
--- Auth lookup (indexed, fast)
+-- Auth lookup (indexed, fast) — legacy path; gated by legacy_credential_state
+-- and LEGACY_API_CREDENTIALS_ENABLED before it is ever used (Phase 8D.3).
+-- A NULL api_key can never match, so credential-less merchants are unreachable.
 SELECT * FROM merchants WHERE api_key = $1;
+
+-- Phase 8D.3 migration progress (runbook: docs/legacy-credentials.md)
+SELECT legacy_credential_state, COUNT(*)
+FROM   merchants GROUP BY 1 ORDER BY 1;
 
 -- Merchant-scoped transaction fetch (isolation enforced here)
 SELECT * FROM transactions WHERE id = $1 AND merchant_id = $2;
@@ -434,3 +477,86 @@ Migration `000014_create_merchant_users` creates:
 | `dashboard_sessions` | Refresh sessions; stores SHA-256 of opaque refresh token only |
 
 Email is **globally unique**. Roles: `OWNER`, `ADMIN`, `VIEWER`. Statuses: `ACTIVE`, `DISABLED`. See [phase-8-auth-design.md](./phase-8-auth-design.md).
+
+---
+
+## Phase 8B — Team invitations
+
+Migration `000015_create_merchant_user_invitations` creates:
+
+| Column | Type | Notes |
+|--------|------|-------|
+| id | UUID | PK |
+| merchant_id | UUID | FK → merchants (ON DELETE CASCADE) |
+| email | VARCHAR(254) | Normalised (lowercase, trimmed) |
+| role | VARCHAR(20) | `OWNER` \| `ADMIN` \| `VIEWER` (CHECK) |
+| token_hash | VARCHAR(64) | **SHA-256 hex of the opaque invitation token — the ONLY token store; plaintext is returned once in the create response and never persisted** |
+| status | VARCHAR(20) | `PENDING` → `ACCEPTED` \| `EXPIRED` \| `REVOKED` (CHECK; `EXPIRED` transitions lazily at read/acceptance time) |
+| expires_at | TIMESTAMPTZ | Token validity (`INVITATION_TOKEN_TTL`, default 48h) |
+| accepted_at | TIMESTAMPTZ | NULL until accepted |
+| created_at / updated_at | TIMESTAMPTZ | |
+
+Indexes: `uq_merchant_user_invitations_token_hash` (O(1) single-use token lookup),
+`uq_merchant_user_invitations_pending` partial UNIQUE `(merchant_id, email) WHERE status = 'PENDING'`
+(at most one active invitation per email), `idx_merchant_user_invitations_merchant_created`.
+
+**This table is the sole authority for invitation validity.** No background
+worker ever mutates it — including the Phase 8C.3C email retention cleanup.
+
+---
+
+## Phase 8C — Email outbox (transactional email)
+
+Migration `000016_create_email_outbox` creates:
+
+| Column | Type | Notes |
+|--------|------|-------|
+| id | UUID | PK |
+| merchant_id | UUID | FK → merchants (ON DELETE CASCADE) |
+| reference_id | UUID | **Conceptual reference to the invitation id — deliberately NOT a foreign key** (type-generic correlation column; see below) |
+| type | VARCHAR(30) | `INVITATION` (CHECK) |
+| recipient | VARCHAR(254) | **PII — delivery target** |
+| subject | VARCHAR(998) | |
+| text_body / html_body | TEXT | **SENSITIVE: rendered at enqueue time and contains the plaintext invitation bearer token by design; `token_hash` is NEVER stored here** |
+| status | VARCHAR(20) | `PENDING` \| `PROCESSING` \| `SENT` \| `FAILED` \| `DEAD` (CHECK) |
+| attempt_count | INT | Incremented at claim time (the claim IS the attempt) |
+| next_attempt_at | TIMESTAMPTZ | Worker schedule |
+| processing_at | TIMESTAMPTZ | Claim timestamp (stale recovery) |
+| last_attempt_at / sent_at | TIMESTAMPTZ | Attempt / delivery timestamps |
+| last_error | TEXT | Sanitized + length-bounded diagnostics (recipient redacted) |
+| created_at / updated_at | TIMESTAMPTZ | |
+
+Indexes: `idx_email_outbox_claim` (partial, `PENDING` due rows),
+`idx_email_outbox_stale` (partial, `PROCESSING` recovery),
+`idx_email_outbox_merchant_id`, and `idx_email_outbox_status` — the latter was
+intentionally provisioned for **operational/retention sweeps** (Phase 8C.3C).
+
+State machine — owned by two workers with **disjoint** state sets:
+
+| Worker | States | Behavior |
+|--------|--------|----------|
+| `EmailOutboxWorker` (8C.3B) | `PENDING`, `PROCESSING` | `FOR UPDATE SKIP LOCKED` claim → send → `SENT` / retry `PENDING` (shared webhook backoff+jitter, max attempts) / `DEAD`; stale `PROCESSING` recovery. **At-least-once.** |
+| `EmailOutboxCleanupWorker` (8C.3C) | `SENT`, `DEAD` only | Retention `DELETE`, full-row, bounded batches |
+
+Retention policy (defaults, `EMAIL_OUTBOX_SENT_RETENTION` / `EMAIL_OUTBOX_DEAD_RETENTION`):
+
+- `SENT` → deleted after **7 days** (strict `sent_at < now() - 168h`)
+- `DEAD` → deleted after **30 days** (strict `updated_at < now() - 720h`)
+- `PENDING` / `PROCESSING` → **never** deleted by retention, regardless of age
+  (stale recovery stays exclusively with the delivery worker)
+- Worker is opt-in (`EMAIL_CLEANUP_ENABLED`, default `false`); zero/negative
+  retention, interval, or batch size is rejected at startup
+
+**`email_outbox.reference_id` vs `merchant_user_invitations`:** the
+invitation-scoped email stores the invitation id in `reference_id` purely as a
+correlation value — there is intentionally **no database foreign key** (the
+column is type-generic and the outbox must never constrain or cascade into the
+invitation table). Consequently, deleting an `email_outbox` row during retention
+cleanup removes delivery history only: invitation rows, `token_hash`, status,
+and token expiration are untouched, and invitation validity is unaffected.
+`merchant_user_invitations` rows are removed only by their own lifecycle
+(`merchant_users`-driven flows / merchant cascade) — never by email cleanup.
+
+**No API exposes `email_outbox`** (rows contain the plaintext bearer token);
+access is worker/repository only, and cleanup logs carry counts/duration only —
+never recipient, subject, body, or token material.

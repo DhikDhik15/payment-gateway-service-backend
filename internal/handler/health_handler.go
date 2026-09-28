@@ -37,31 +37,37 @@ func (h *HealthHandler) Live(c *gin.Context) {
 // Ready godoc
 //
 //	@Summary		Readiness check
-//	@Description	Returns 200 when the server can accept traffic (database reachable).
+//	@Description	Returns 200 when the database is reachable and the clean schema version is supported.
 //	@Tags			health
 //	@Produce		json
 //	@Success		200	{object}	response.successEnvelope{data=healthData}
 //	@Failure		503	{object}	response.errorEnvelope
 //	@Router			/health/ready [get]
+func (h *HealthHandler) notReady(c *gin.Context, code, message string) {
+	c.JSON(503, gin.H{
+		"success": false,
+		"error": gin.H{
+			"code":    code,
+			"message": message,
+		},
+		"meta": gin.H{
+			"request_id": c.GetString("request_id"),
+		},
+	})
+}
+
 func (h *HealthHandler) Ready(c *gin.Context) {
 	if h.db == nil {
-		response.InternalServerError(c)
+		h.notReady(c, "DATABASE_UNAVAILABLE", "Database is not ready")
 		return
 	}
 
 	if err := database.Ping(c.Request.Context(), h.db); err != nil {
-		// 503 is not in our standard set, so we write it manually here only.
-		// A proper ServiceUnavailable helper can be added if more endpoints need it.
-		c.JSON(503, gin.H{
-			"success": false,
-			"error": gin.H{
-				"code":    "DATABASE_UNAVAILABLE",
-				"message": "Database is not reachable",
-			},
-			"meta": gin.H{
-				"request_id": c.GetString("request_id"),
-			},
-		})
+		h.notReady(c, "DATABASE_UNAVAILABLE", "Database is not ready")
+		return
+	}
+	if err := database.CheckSchema(c.Request.Context(), h.db); err != nil {
+		h.notReady(c, "DATABASE_NOT_READY", "Database schema is not ready")
 		return
 	}
 

@@ -5,8 +5,12 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/dhikaarta/pay-gate-backend/internal/model"
+	"github.com/dhikaarta/pay-gate-backend/internal/repository"
 )
 
 const mockProviderName = "MOCK"
@@ -32,13 +36,21 @@ type MockPaymentProvider struct {
 	// ExpiryDuration controls how far ahead ExpiredAt is set.
 	// Defaults to 30 minutes when zero.
 	ExpiryDuration time.Duration
+	store          repository.MockPaymentRepository
+	frontendURL    string
 	createCalls    atomic.Uint64
 }
 
 // NewMockPaymentProvider returns a MockPaymentProvider with sensible defaults
 // (always succeeds, 30-minute expiry).
 func NewMockPaymentProvider() *MockPaymentProvider {
-	return &MockPaymentProvider{}
+	// Unit-test-only constructor. Server wiring always uses the configured,
+	// persisted constructor below.
+	return &MockPaymentProvider{frontendURL: "https://mock-provider.test"}
+}
+
+func NewPersistedMockPaymentProvider(store repository.MockPaymentRepository, frontendURL string) *MockPaymentProvider {
+	return &MockPaymentProvider{store: store, frontendURL: strings.TrimRight(frontendURL, "/")}
 }
 
 // Name satisfies PaymentProvider — returns "MOCK".
@@ -48,7 +60,7 @@ func (m *MockPaymentProvider) Name() string {
 
 // CreatePayment simulates payment creation.
 // Returns a deterministic-enough response for unit tests.
-func (m *MockPaymentProvider) CreatePayment(_ context.Context, req ProviderCreateRequest) (*ProviderPaymentResponse, error) {
+func (m *MockPaymentProvider) CreatePayment(ctx context.Context, req ProviderCreateRequest) (*ProviderPaymentResponse, error) {
 	m.createCalls.Add(1)
 	if m.ShouldTimeout {
 		return nil, ErrProviderTimeout
@@ -59,12 +71,21 @@ func (m *MockPaymentProvider) CreatePayment(_ context.Context, req ProviderCreat
 
 	mockTxID := generateMockID()
 	expiry := m.expiredAt()
+	if m.store != nil {
+		if err := m.store.Create(ctx, &model.MockPayment{PublicID: mockTxID, ProviderTransactionID: mockTxID, GatewayTransactionID: req.TransactionID, MerchantOrderID: req.MerchantOrderID, Amount: req.Amount, Currency: req.Currency, PaymentMethod: req.PaymentMethod, Status: model.TransactionStatusPending, ExpiredAt: expiry, CreatedAt: time.Now().UTC()}); err != nil {
+			return nil, fmt.Errorf("persist mock provider transaction: %w", err)
+		}
+	}
+	frontendURL := m.frontendURL
+	if frontendURL == "" {
+		frontendURL = "https://mock-provider.test"
+	}
 
 	return &ProviderPaymentResponse{
 		Provider:              mockProviderName,
 		ProviderTransactionID: mockTxID,
 		Status:                "PENDING",
-		PaymentURL:            fmt.Sprintf("https://mock-payment.local/pay/%s", mockTxID),
+		PaymentURL:            fmt.Sprintf("%s/pay/%s", frontendURL, mockTxID),
 		ExpiredAt:             &expiry,
 	}, nil
 }
@@ -104,9 +125,11 @@ func (m *MockPaymentProvider) CancelPayment(_ context.Context, _ string) error {
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
-// generateMockID returns a random hex string in the format "MOCK-TXN-{hex8}".
+// generateMockID returns a 128-bit random public capability in the format
+// "MOCK-TXN-{hex32}". It is safe to expose only in the limited development
+// provider flow; it is never accepted as dashboard or merchant API auth.
 func generateMockID() string {
-	b := make([]byte, 4)
+	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
 		// Fallback — should never happen.
 		return "MOCK-TXN-fallback"

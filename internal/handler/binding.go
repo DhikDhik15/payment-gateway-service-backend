@@ -2,6 +2,7 @@ package handler
 
 import (
 	"errors"
+	"net/http"
 	"strings"
 
 	"github.com/go-playground/validator/v10"
@@ -14,6 +15,15 @@ import (
 // description of why the field failed.
 func parseBindingErrors(err error) map[string]string {
 	details := make(map[string]string)
+
+	// Phase 8D.2: the global body limit (middleware.MaxBodyBytes) trips
+	// http.MaxBytesReader while the handler reads — report a stable message
+	// instead of the raw error text.
+	var maxBytesErr *http.MaxBytesError
+	if errors.As(err, &maxBytesErr) {
+		details["_"] = "Request body exceeds the configured size limit"
+		return details
+	}
 
 	var ve validator.ValidationErrors
 	if !errors.As(err, &ve) {

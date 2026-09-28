@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"strings"
 
+	"github.com/dhikaarta/pay-gate-backend/internal/audit"
 	"github.com/dhikaarta/pay-gate-backend/internal/model"
 	"github.com/dhikaarta/pay-gate-backend/internal/repository"
 	"github.com/dhikaarta/pay-gate-backend/internal/service"
@@ -23,12 +24,13 @@ const headerAuthorization = "Authorization"
 //   - Validates JWT signature and expiry via authSvc.VerifyAccessToken
 //   - Loads the authenticated user from the database
 //   - Verifies the user is still ACTIVE
+//   - Loads the user's merchant and verifies the merchant is ACTIVE
 //   - Stores the user as model.ContextKeyDashboardUser in the Gin context
 //
 // On failure:
 //   - Returns 401 with a generic error (no internal details exposed)
 //   - Aborts the handler chain
-func RequireDashboardAuth(authSvc service.AuthService, userRepo repository.MerchantUserRepository) gin.HandlerFunc {
+func RequireDashboardAuth(authSvc service.AuthService, userRepo repository.MerchantUserRepository, merchantRepo repository.MerchantRepository) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		token := bearerToken(c)
 		if token == "" {
@@ -87,8 +89,44 @@ func RequireDashboardAuth(authSvc service.AuthService, userRepo repository.Merch
 			return
 		}
 
+		// Load the merchant and verify it is ACTIVE.
+		// Merchant identity is derived from the authenticated user — never from
+		// the request body or URL parameters.
+		merchant, err := merchantRepo.GetByID(c.Request.Context(), user.MerchantID)
+		if err != nil {
+			if errors.Is(err, repository.ErrMerchantNotFound) {
+				// Merchant was deleted after the user was created.
+				response.Unauthorized(c, response.CodeInvalidCredentials, "Authentication required")
+			} else {
+				slog.Error("dashboard auth: merchant lookup error",
+					slog.String("request_id", c.GetString(response.ContextKey)),
+					slog.String("merchant_id", user.MerchantID.String()),
+					slog.String("error", err.Error()),
+				)
+				response.InternalServerError(c)
+			}
+			c.Abort()
+			return
+		}
+
+		if !merchant.IsActive() {
+			slog.Info("dashboard auth: merchant not active",
+				slog.String("user_id", userID.String()),
+				slog.String("merchant_id", merchant.ID.String()),
+				slog.String("merchant_status", string(merchant.Status)),
+			)
+			response.Unauthorized(c, response.CodeMerchantInactive, "Merchant account is not active")
+			c.Abort()
+			return
+		}
+
 		// Attach authenticated user to context.
 		c.Set(model.ContextKeyDashboardUser, user)
+		c.Request = c.Request.WithContext(audit.WithActor(c.Request.Context(), audit.Actor{
+			Type:       audit.ActorTypeDashboardUser,
+			UserID:     audit.UUIDPtr(user.ID),
+			MerchantID: audit.UUIDPtr(user.MerchantID),
+		}))
 		c.Next()
 	}
 }

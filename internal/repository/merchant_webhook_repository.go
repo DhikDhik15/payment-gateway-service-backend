@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/dhikaarta/pay-gate-backend/internal/audit"
 	"github.com/dhikaarta/pay-gate-backend/internal/model"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -29,12 +30,17 @@ type MerchantWebhookConfigRepository interface {
 }
 
 type pgMerchantWebhookConfigRepository struct {
-	db *pgxpool.Pool
+	db      *pgxpool.Pool
+	auditor audit.Recorder
 }
 
 // NewMerchantWebhookConfigRepository returns a PostgreSQL-backed config repository.
-func NewMerchantWebhookConfigRepository(db *pgxpool.Pool) MerchantWebhookConfigRepository {
-	return &pgMerchantWebhookConfigRepository{db: db}
+func NewMerchantWebhookConfigRepository(db *pgxpool.Pool, recorders ...audit.Recorder) MerchantWebhookConfigRepository {
+	var recorder audit.Recorder
+	if len(recorders) > 0 {
+		recorder = recorders[0]
+	}
+	return &pgMerchantWebhookConfigRepository{db: db, auditor: recorder}
 }
 
 func (r *pgMerchantWebhookConfigRepository) Upsert(ctx context.Context, cfg *model.MerchantWebhookConfig) error {
@@ -49,13 +55,48 @@ func (r *pgMerchantWebhookConfigRepository) Upsert(ctx context.Context, cfg *mod
 		    description      = EXCLUDED.description,
 		    updated_at       = EXCLUDED.updated_at
 		RETURNING id, created_at, updated_at`
-	err := r.db.QueryRow(ctx, q,
+
+	_, hasEvent := audit.EventFromContext(ctx)
+	if !hasEvent {
+		err := r.db.QueryRow(ctx, q,
+			cfg.ID, cfg.MerchantID, cfg.URL, cfg.EncryptedSecret, cfg.Status,
+			cfg.Description, cfg.CreatedAt, cfg.UpdatedAt,
+		).Scan(&cfg.ID, &cfg.CreatedAt, &cfg.UpdatedAt)
+		if err != nil {
+			return fmt.Errorf("webhook config upsert: %w", err)
+		}
+		return nil
+	}
+	if err := audit.RequireRecorder(ctx, r.auditor); err != nil {
+		return err
+	}
+
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("webhook config upsert begin: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+	if err := tx.QueryRow(ctx, q,
 		cfg.ID, cfg.MerchantID, cfg.URL, cfg.EncryptedSecret, cfg.Status,
 		cfg.Description, cfg.CreatedAt, cfg.UpdatedAt,
-	).Scan(&cfg.ID, &cfg.CreatedAt, &cfg.UpdatedAt)
-	if err != nil {
+	).Scan(&cfg.ID, &cfg.CreatedAt, &cfg.UpdatedAt); err != nil {
 		return fmt.Errorf("webhook config upsert: %w", err)
 	}
+	if event, ok := audit.EventFromContext(ctx); ok {
+		event.TargetID = audit.UUIDPtr(cfg.ID)
+		if err := audit.RecordEventInTx(ctx, tx, r.auditor, event); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("webhook config upsert commit: %w", err)
+	}
+	committed = true
 	return nil
 }
 
@@ -95,13 +136,45 @@ func (r *pgMerchantWebhookConfigRepository) UpdateSecret(ctx context.Context, me
 		SET encrypted_secret = $1, updated_at = NOW()
 		WHERE merchant_id = $2
 		RETURNING id, merchant_id, url, encrypted_secret, status, description, created_at, updated_at`
-	cfg, err := scanWebhookConfig(r.db.QueryRow(ctx, q, encryptedSecret, merchantID))
+	_, hasEvent := audit.EventFromContext(ctx)
+	if !hasEvent {
+		cfg, err := scanWebhookConfig(r.db.QueryRow(ctx, q, encryptedSecret, merchantID))
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil, ErrMerchantWebhookConfigNotFound
+			}
+			return nil, fmt.Errorf("webhook config rotate: %w", err)
+		}
+		return cfg, nil
+	}
+	if err := audit.RequireRecorder(ctx, r.auditor); err != nil {
+		return nil, err
+	}
+
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("webhook config rotate begin: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+	cfg, err := scanWebhookConfig(tx.QueryRow(ctx, q, encryptedSecret, merchantID))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrMerchantWebhookConfigNotFound
 		}
 		return nil, fmt.Errorf("webhook config rotate: %w", err)
 	}
+	if err := audit.RecordInTxIfPresent(ctx, tx, r.auditor); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("webhook config rotate commit: %w", err)
+	}
+	committed = true
 	return cfg, nil
 }
 
@@ -111,13 +184,45 @@ func (r *pgMerchantWebhookConfigRepository) Disable(ctx context.Context, merchan
 		SET status = 'DISABLED', updated_at = NOW()
 		WHERE merchant_id = $1
 		RETURNING id, merchant_id, url, encrypted_secret, status, description, created_at, updated_at`
-	cfg, err := scanWebhookConfig(r.db.QueryRow(ctx, q, merchantID))
+	_, hasEvent := audit.EventFromContext(ctx)
+	if !hasEvent {
+		cfg, err := scanWebhookConfig(r.db.QueryRow(ctx, q, merchantID))
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil, ErrMerchantWebhookConfigNotFound
+			}
+			return nil, fmt.Errorf("webhook config disable: %w", err)
+		}
+		return cfg, nil
+	}
+	if err := audit.RequireRecorder(ctx, r.auditor); err != nil {
+		return nil, err
+	}
+
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("webhook config disable begin: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+	cfg, err := scanWebhookConfig(tx.QueryRow(ctx, q, merchantID))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrMerchantWebhookConfigNotFound
 		}
 		return nil, fmt.Errorf("webhook config disable: %w", err)
 	}
+	if err := audit.RecordInTxIfPresent(ctx, tx, r.auditor); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("webhook config disable commit: %w", err)
+	}
+	committed = true
 	return cfg, nil
 }
 

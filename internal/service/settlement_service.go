@@ -15,14 +15,15 @@ import (
 )
 
 var (
-	ErrSettlementNotFound        = errors.New("settlement not found")
-	ErrSettlementAlreadyExists   = errors.New("settlement already exists")
-	ErrSettlementImportInvalid   = errors.New("settlement import invalid")
-	ErrSettlementImportConflict  = errors.New("settlement import conflict")
-	ErrSettlementInvalidStatus   = errors.New("settlement invalid status")
-	ErrReconciliationNotFound    = errors.New("reconciliation not found")
-	ErrReconciliationRunning     = errors.New("reconciliation already running")
-	ErrUnknownSettlementProvider = errors.New("unknown settlement provider")
+	ErrSettlementNotFound            = errors.New("settlement not found")
+	ErrSettlementAlreadyExists       = errors.New("settlement already exists")
+	ErrSettlementImportInvalid       = errors.New("settlement import invalid")
+	ErrSettlementImportConflict      = errors.New("settlement import conflict")
+	ErrSettlementInvalidStatus       = errors.New("settlement invalid status")
+	ErrReconciliationNotFound        = errors.New("reconciliation not found")
+	ErrReconciliationRunning         = errors.New("reconciliation already running")
+	ErrUnknownSettlementProvider     = errors.New("unknown settlement provider")
+	ErrSettlementProviderUnsupported = errors.New("settlement provider is not configured")
 )
 
 // SettlementService handles import and read APIs for settlements.
@@ -41,8 +42,9 @@ type ListSettlementsResult struct {
 }
 
 type settlementService struct {
-	repo      repository.SettlementRepository
-	importers map[string]SettlementImporter
+	repo               repository.SettlementRepository
+	importers          map[string]SettlementImporter
+	configuredProvider string
 }
 
 func NewSettlementService(repo repository.SettlementRepository, importers ...SettlementImporter) SettlementService {
@@ -53,7 +55,25 @@ func NewSettlementService(repo repository.SettlementRepository, importers ...Set
 	return &settlementService{repo: repo, importers: m}
 }
 
+// NewSettlementServiceForProvider is the production-aware constructor. The
+// current repository has only a mock settlement importer; non-mock providers
+// must not accept an operator payload as if it were provider-verified data.
+func NewSettlementServiceForProvider(repo repository.SettlementRepository, configuredProvider string, importers ...SettlementImporter) SettlementService {
+	m := make(map[string]SettlementImporter, len(importers))
+	for _, im := range importers {
+		m[strings.ToUpper(im.ProviderName())] = im
+	}
+	return &settlementService{
+		repo:               repo,
+		importers:          m,
+		configuredProvider: strings.ToLower(strings.TrimSpace(configuredProvider)),
+	}
+}
+
 func (s *settlementService) Import(ctx context.Context, req model.ImportSettlementRequest) (*model.Settlement, bool, error) {
+	if s.configuredProvider != "" && !strings.EqualFold(s.configuredProvider, mockProviderName) {
+		return nil, false, ErrSettlementProviderUnsupported
+	}
 	provider := strings.ToUpper(strings.TrimSpace(req.Provider))
 	ref := strings.TrimSpace(req.SettlementRef)
 	if provider == "" || ref == "" {

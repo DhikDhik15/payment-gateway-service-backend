@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -50,6 +51,17 @@ func (r *mockListTransactionRepo) applyFilter(merchantID uuid.UUID, f model.Tran
 		}
 		if f.CreatedTo != nil && !tx.CreatedAt.Before(*f.CreatedTo) {
 			continue
+		}
+		if f.Search != nil && *f.Search != "" {
+			q := strings.ToLower(*f.Search)
+			match := strings.Contains(strings.ToLower(tx.MerchantOrderID), q) ||
+				tx.ID.String() == *f.Search
+			if !match && tx.ProviderTransactionID != nil {
+				match = strings.Contains(strings.ToLower(*tx.ProviderTransactionID), q)
+			}
+			if !match {
+				continue
+			}
 		}
 		cp := *tx
 		out = append(out, &cp)
@@ -442,5 +454,71 @@ func TestListPayments_OnlyOneCreatedBound(t *testing.T) {
 	}
 	if res2.Total != 1 || res2.Transactions[0].MerchantOrderID != "OLD" {
 		t.Errorf("only created_to: expected 1 OLD, got total=%d", res2.Total)
+	}
+}
+
+func TestListPayments_SearchOrderID(t *testing.T) {
+	svc, txRepo, _ := buildListService()
+	mID := uuid.New()
+	now := time.Now().UTC()
+	insertTx(txRepo, mID, "ORDER-001", model.TransactionStatusPending, now)
+	insertTx(txRepo, mID, "ORDER-002", model.TransactionStatusPending, now.Add(-time.Second))
+
+	search := "ORDER-001"
+	res, err := svc.ListPayments(context.Background(), mID, model.TransactionListFilter{
+		Page: 1, Limit: 20, Search: &search,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Total != 1 || len(res.Transactions) != 1 {
+		t.Fatalf("search: expected 1, got total=%d len=%d", res.Total, len(res.Transactions))
+	}
+	if res.Transactions[0].MerchantOrderID != "ORDER-001" {
+		t.Errorf("search: got %s", res.Transactions[0].MerchantOrderID)
+	}
+}
+
+func TestListPayments_StatusPendingOnly(t *testing.T) {
+	svc, txRepo, _ := buildListService()
+	mID := uuid.New()
+	now := time.Now().UTC()
+	insertTx(txRepo, mID, "P1", model.TransactionStatusPending, now)
+	insertTx(txRepo, mID, "C1", model.TransactionStatusPaid, now.Add(-time.Second))
+
+	pending := model.TransactionStatusPending
+	res, err := svc.ListPayments(context.Background(), mID, model.TransactionListFilter{
+		Page: 1, Limit: 20, Status: &pending,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Total != 1 || res.Transactions[0].Status != model.TransactionStatusPending {
+		t.Fatalf("status filter: expected 1 PENDING, got total=%d status=%v", res.Total, res.Transactions[0].Status)
+	}
+}
+
+func TestListPayments_PaginationFifteen(t *testing.T) {
+	svc, txRepo, _ := buildListService()
+	mID := uuid.New()
+	now := time.Now().UTC()
+	for i := 0; i < 15; i++ {
+		insertTx(txRepo, mID, uuid.New().String(), model.TransactionStatusPending, now.Add(-time.Duration(i)*time.Second))
+	}
+
+	page1, err := svc.ListPayments(context.Background(), mID, model.TransactionListFilter{Page: 1, Limit: 10})
+	if err != nil {
+		t.Fatalf("page1: %v", err)
+	}
+	if len(page1.Transactions) != 10 || page1.Total != 15 || page1.TotalPages != 2 {
+		t.Fatalf("page1: len=%d total=%d pages=%d", len(page1.Transactions), page1.Total, page1.TotalPages)
+	}
+
+	page2, err := svc.ListPayments(context.Background(), mID, model.TransactionListFilter{Page: 2, Limit: 10})
+	if err != nil {
+		t.Fatalf("page2: %v", err)
+	}
+	if len(page2.Transactions) != 5 {
+		t.Fatalf("page2: expected 5 records, got %d", len(page2.Transactions))
 	}
 }

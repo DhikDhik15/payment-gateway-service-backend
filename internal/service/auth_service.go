@@ -62,11 +62,16 @@ type AuthService interface {
 	// token. Idempotent — not finding the session is not an error.
 	Logout(ctx context.Context, refreshTokenHash string) error
 
+	// LogoutSession revokes the exact dashboard session identified by a valid
+	// access token's stable sid claim and subject. It is idempotent and never
+	// crosses the user/tenant boundary.
+	LogoutSession(ctx context.Context, sessionID uuid.UUID, userID uuid.UUID) error
+
 	// Me returns the public profile of the authenticated user.
 	Me(ctx context.Context, userID uuid.UUID) (*model.DashboardUserResponse, error)
 
-	// RefreshAccessToken validates the plaintext refresh token, rotates the
-	// session (revoke old, create new), and issues a new access token.
+	// RefreshAccessToken validates the plaintext refresh token, atomically
+	// rotates the session, and issues a new access token.
 	// Returns (loginResponse, newPlaintextRefreshToken, error).
 	RefreshAccessToken(ctx context.Context, plainRefreshToken string) (*model.LoginResponse, string, error)
 
@@ -78,21 +83,33 @@ type AuthService interface {
 // ─── Implementation ───────────────────────────────────────────────────────────
 
 type authService struct {
-	userRepo    repository.MerchantUserRepository
-	sessionRepo repository.DashboardSessionRepository
-	cfg         AuthConfig
+	userRepo     repository.MerchantUserRepository
+	sessionRepo  repository.DashboardSessionRepository
+	merchantRepo repository.MerchantRepository
+	cfg          AuthConfig
 }
 
 // NewAuthService constructs an AuthService.
+//
+// merchantRepo is optional for backwards-compatible unit-test construction;
+// the production wiring supplies it so login and refresh enforce the merchant
+// lifecycle check. When present, refresh resolves the merchant from the
+// server-side session's user and never from client input.
 func NewAuthService(
 	userRepo repository.MerchantUserRepository,
 	sessionRepo repository.DashboardSessionRepository,
 	cfg AuthConfig,
+	merchantRepos ...repository.MerchantRepository,
 ) AuthService {
+	var merchantRepo repository.MerchantRepository
+	if len(merchantRepos) > 0 {
+		merchantRepo = merchantRepos[0]
+	}
 	return &authService{
-		userRepo:    userRepo,
-		sessionRepo: sessionRepo,
-		cfg:         cfg,
+		userRepo:     userRepo,
+		sessionRepo:  sessionRepo,
+		merchantRepo: merchantRepo,
+		cfg:          cfg,
 	}
 }
 
@@ -134,46 +151,90 @@ func (s *authService) Login(ctx context.Context, req model.LoginRequest) (*model
 		return nil, "", ErrUserDisabled
 	}
 
+	// Login is an unauthenticated endpoint, so it must enforce the merchant
+	// lifecycle boundary itself. The refresh path repeats this check under the
+	// session/merchant transaction; this early check avoids issuing a new
+	// cookie for an already inactive tenant.
+	if s.merchantRepo != nil {
+		merchant, merchantErr := s.merchantRepo.GetByID(ctx, user.MerchantID)
+		if merchantErr != nil {
+			if errors.Is(merchantErr, repository.ErrMerchantNotFound) {
+				return nil, "", ErrInvalidCredentials
+			}
+			return nil, "", fmt.Errorf("login: get merchant: %w", merchantErr)
+		}
+		if !merchant.IsActive() {
+			return nil, "", ErrInvalidCredentials
+		}
+	}
+
 	return s.issueTokens(ctx, user)
 }
 
-// issueTokens creates a new JWT + refresh session for a user.
-func (s *authService) issueTokens(ctx context.Context, user *model.MerchantUser) (*model.LoginResponse, string, error) {
-	now := time.Now().UTC()
+type issuedTokenPair struct {
+	response *model.LoginResponse
+	refresh  string
+	session  *model.DashboardSession
+}
 
-	// Build access token claims.
+// buildTokenPair creates the access token and replacement-session material but
+// does not persist anything. Keeping persistence separate lets refresh commit
+// the old-session claim and replacement update in one database transaction.
+//
+// sessionID is the stable logical dashboard-session identity. A zero value
+// creates a new session ID for login; refresh passes the existing row ID so
+// every access token issued during the session can safely target logout.
+func (s *authService) buildTokenPair(user *model.MerchantUser, now time.Time, sessionID uuid.UUID) (*issuedTokenPair, error) {
+	// Work from a value snapshot so a concurrent status/role change cannot
+	// mutate the claims while they are being assembled.
+	userSnapshot := *user
+	if sessionID == uuid.Nil {
+		sessionID = uuid.New()
+	}
 	claims := jwtClaims{
-		Subject:    user.ID.String(),
-		MerchantID: user.MerchantID.String(),
-		Role:       string(user.Role),
+		Subject:    userSnapshot.ID.String(),
+		MerchantID: userSnapshot.MerchantID.String(),
+		Role:       string(userSnapshot.Role),
 		IssuedAt:   now.Unix(),
 		ExpiresAt:  now.Add(s.cfg.AccessTokenTTL).Unix(),
 		JTI:        generateJTI(),
+		SessionID:  sessionID.String(),
 	}
 
 	accessToken, err := signJWT(claims, s.cfg.JWTSecret)
 	if err != nil {
-		return nil, "", fmt.Errorf("issue tokens: sign jwt: %w", err)
+		return nil, fmt.Errorf("issue tokens: sign jwt: %w", err)
 	}
 
-	// Generate opaque refresh token and store its hash.
 	plainRefresh, err := generateRefreshToken()
 	if err != nil {
-		return nil, "", fmt.Errorf("issue tokens: generate refresh: %w", err)
+		return nil, fmt.Errorf("issue tokens: generate refresh: %w", err)
 	}
 
 	session := &model.DashboardSession{
-		ID:               uuid.New(),
-		MerchantUserID:   user.ID,
+		ID:               sessionID,
+		MerchantUserID:   userSnapshot.ID,
 		RefreshTokenHash: hashRefreshToken(plainRefresh),
 		ExpiresAt:        now.Add(s.cfg.RefreshTokenTTL),
 		CreatedAt:        now,
 	}
-	if err := s.sessionRepo.Create(ctx, session); err != nil {
-		return nil, "", fmt.Errorf("issue tokens: create session: %w", err)
-	}
 
-	// Best-effort last_login_at update — must not fail the login.
+	return &issuedTokenPair{
+		response: &model.LoginResponse{
+			AccessToken: accessToken,
+			TokenType:   "Bearer",
+			ExpiresIn:   int(s.cfg.AccessTokenTTL.Seconds()),
+			User:        toUserResponse(&userSnapshot),
+		},
+		refresh: plainRefresh,
+		session: session,
+	}, nil
+}
+
+// recordTokenIssue performs the existing best-effort last-login update and
+// safe event logging. It is called only after the relevant session transaction
+// has committed.
+func (s *authService) recordTokenIssue(ctx context.Context, user *model.MerchantUser, now time.Time) {
 	if err := s.userRepo.UpdateLastLoginAt(ctx, user.ID, now); err != nil {
 		slog.Warn("dashboard auth: failed to update last_login_at",
 			slog.String("user_id", user.ID.String()),
@@ -187,14 +248,21 @@ func (s *authService) issueTokens(ctx context.Context, user *model.MerchantUser)
 		slog.String("role", string(user.Role)),
 		// access token and refresh token are NEVER logged
 	)
+}
 
-	resp := &model.LoginResponse{
-		AccessToken: accessToken,
-		TokenType:   "Bearer",
-		ExpiresIn:   int(s.cfg.AccessTokenTTL.Seconds()),
-		User:        toUserResponse(user),
+// issueTokens creates a new JWT + refresh session for a user during login.
+func (s *authService) issueTokens(ctx context.Context, user *model.MerchantUser) (*model.LoginResponse, string, error) {
+	now := time.Now().UTC()
+	pair, err := s.buildTokenPair(user, now, uuid.Nil)
+	if err != nil {
+		return nil, "", err
 	}
-	return resp, plainRefresh, nil
+	if err := s.sessionRepo.Create(ctx, pair.session); err != nil {
+		return nil, "", fmt.Errorf("issue tokens: create session: %w", err)
+	}
+
+	s.recordTokenIssue(ctx, user, now)
+	return pair.response, pair.refresh, nil
 }
 
 // ─── Logout ───────────────────────────────────────────────────────────────────
@@ -218,6 +286,28 @@ func (s *authService) Logout(ctx context.Context, refreshTokenHash string) error
 
 	slog.Info("dashboard auth: logout",
 		slog.String("user_id", session.MerchantUserID.String()),
+		// session ID is internal — do not leak to client
+	)
+	return nil
+}
+
+// LogoutSession revokes the logical session addressed by a valid access token.
+// Unlike the legacy refresh-hash path, the session ID is stable across refresh
+// rotation, so a concurrent refresh cannot leave a replacement session behind.
+func (s *authService) LogoutSession(ctx context.Context, sessionID uuid.UUID, userID uuid.UUID) error {
+	if sessionID == uuid.Nil || userID == uuid.Nil {
+		return ErrInvalidCredentials
+	}
+	if err := s.sessionRepo.DeleteByIDAndUser(ctx, sessionID, userID); err != nil {
+		if errors.Is(err, repository.ErrSessionNotFound) {
+			// Idempotent logout: the session was already revoked or replaced and
+			// subsequently removed by another lifecycle operation.
+			return nil
+		}
+		return fmt.Errorf("logout: delete session by id: %w", err)
+	}
+	slog.Info("dashboard auth: logout",
+		slog.String("user_id", userID.String()),
 		// session ID is internal — do not leak to client
 	)
 	return nil
@@ -250,9 +340,14 @@ func (s *authService) RefreshAccessToken(ctx context.Context, plainRefreshToken 
 		return nil, "", fmt.Errorf("refresh: get session: %w", err)
 	}
 
+	// These checks provide the existing error semantics and avoid expensive
+	// token generation for obviously invalid credentials. The production
+	// rotation transaction repeats the lifecycle checks under row locks before
+	// committing the replacement.
 	if session.IsExpired() {
-		// Clean up the expired session.
-		_ = s.sessionRepo.Delete(ctx, session.ID)
+		// Do not delete by the pre-read session ID here. A concurrent refresh
+		// may already have rotated that row; the transactional CAS path is
+		// the sole authority for replacement/revocation.
 		return nil, "", ErrInvalidCredentials
 	}
 
@@ -260,19 +355,71 @@ func (s *authService) RefreshAccessToken(ctx context.Context, plainRefreshToken 
 	if err != nil {
 		return nil, "", fmt.Errorf("refresh: get user: %w", err)
 	}
-
 	if !user.IsActive() {
-		// User was disabled after the session was created — revoke.
-		_ = s.sessionRepo.Delete(ctx, session.ID)
+		// Lifecycle invalidation is performed by the transactional status
+		// operation. Never remove a possibly rotated replacement by a stale
+		// pre-read ID here.
 		return nil, "", ErrUserDisabled
 	}
 
-	// Rotate: delete old session before issuing new tokens.
-	// If this fails, the old session remains valid — acceptable because
-	// the new session would simply be a second valid slot.
-	_ = s.sessionRepo.Delete(ctx, session.ID)
+	// A refresh must obey the same merchant lifecycle boundary as an
+	// authenticated dashboard request. The merchant is derived from the
+	// server-side user/session; no request field participates in this lookup.
+	if s.merchantRepo != nil {
+		merchant, merchantErr := s.merchantRepo.GetByID(ctx, user.MerchantID)
+		if merchantErr != nil {
+			if errors.Is(merchantErr, repository.ErrMerchantNotFound) {
+				return nil, "", ErrInvalidCredentials
+			}
+			return nil, "", fmt.Errorf("refresh: get merchant: %w", merchantErr)
+		}
+		if !merchant.IsActive() {
+			return nil, "", ErrInvalidCredentials
+		}
+	}
 
-	return s.issueTokens(ctx, user)
+	now := time.Now().UTC()
+	pair, err := s.buildTokenPair(user, now, session.ID)
+	if err != nil {
+		return nil, "", err
+	}
+
+	if err := s.rotateRefreshSession(ctx, tokenHash, pair.session); err != nil {
+		return nil, "", err
+	}
+
+	// Only report success after the replacement transaction has committed.
+	s.recordTokenIssue(ctx, user, now)
+	return pair.response, pair.refresh, nil
+}
+
+// rotateRefreshSession requires the database transaction capability. A
+// missing capability is a hard configuration error: falling back to a
+// delete-then-create sequence would reintroduce the partial-rotation race this
+// phase is intended to eliminate.
+func (s *authService) rotateRefreshSession(
+	ctx context.Context,
+	oldTokenHash string,
+	replacement *model.DashboardSession,
+) error {
+	rotator, ok := s.sessionRepo.(repository.AtomicRefreshSessionRepository)
+	if !ok {
+		return fmt.Errorf("refresh: transactional session repository unavailable")
+	}
+	_, err := rotator.RotateByRefreshTokenHash(ctx, oldTokenHash, replacement)
+	if err == nil {
+		return nil
+	}
+	switch {
+	case errors.Is(err, repository.ErrSessionNotFound),
+		errors.Is(err, repository.ErrSessionExpired),
+		errors.Is(err, repository.ErrSessionMerchantInactive):
+		return ErrInvalidCredentials
+	case errors.Is(err, repository.ErrSessionUserDisabled):
+		return ErrUserDisabled
+	default:
+		return fmt.Errorf("refresh: rotate session: %w", err)
+	}
 }
 
 // ─── VerifyAccessToken ────────────────────────────────────────────────────────

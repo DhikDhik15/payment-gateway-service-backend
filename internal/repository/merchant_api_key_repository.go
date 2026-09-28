@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/dhikaarta/pay-gate-backend/internal/audit"
 	"github.com/dhikaarta/pay-gate-backend/internal/model"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -30,6 +32,9 @@ type MerchantAPIKeyRepository interface {
 	// Create inserts a new API key row. key.ID, key.KeyID, key.SecretHash,
 	// key.MerchantID, and key.Name must be populated by the caller.
 	Create(ctx context.Context, key *model.MerchantAPIKey) error
+
+	// CreateInTx inserts a new API key row using an existing transaction.
+	CreateInTx(ctx context.Context, tx pgx.Tx, key *model.MerchantAPIKey) error
 
 	// GetByID retrieves a key by its primary key, enforcing merchant ownership.
 	// Returns ErrMerchantAPIKeyNotFound if id does not exist or belongs to a
@@ -64,23 +69,70 @@ type MerchantAPIKeyRepository interface {
 // ─── PostgreSQL implementation ────────────────────────────────────────────────
 
 type pgMerchantAPIKeyRepository struct {
-	db *pgxpool.Pool
+	db      *pgxpool.Pool
+	auditor audit.Recorder
 }
 
 // NewMerchantAPIKeyRepository returns a PostgreSQL-backed MerchantAPIKeyRepository.
-func NewMerchantAPIKeyRepository(db *pgxpool.Pool) MerchantAPIKeyRepository {
-	return &pgMerchantAPIKeyRepository{db: db}
+// The optional recorder enables atomic audit writes for credential mutations.
+func NewMerchantAPIKeyRepository(db *pgxpool.Pool, recorders ...audit.Recorder) MerchantAPIKeyRepository {
+	var recorder audit.Recorder
+	if len(recorders) > 0 {
+		recorder = recorders[0]
+	}
+	return &pgMerchantAPIKeyRepository{db: db, auditor: recorder}
 }
 
-// Create inserts a new merchant_api_keys row.
+// Create inserts a new merchant_api_keys row. If an audit event is attached,
+// the credential and event are committed in one transaction.
 func (r *pgMerchantAPIKeyRepository) Create(ctx context.Context, key *model.MerchantAPIKey) error {
+	_, hasEvent := audit.EventFromContext(ctx)
+	if !hasEvent {
+		return insertMerchantAPIKey(ctx, r.db, key)
+	}
+	if err := audit.RequireRecorder(ctx, r.auditor); err != nil {
+		return err
+	}
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("merchant api key repository create begin: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+	if err := insertMerchantAPIKey(ctx, tx, key); err != nil {
+		return err
+	}
+	if err := audit.RecordInTxIfPresent(ctx, tx, r.auditor); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("merchant api key repository create commit: %w", err)
+	}
+	committed = true
+	return nil
+}
+
+// CreateInTx inserts a new merchant_api_keys row within an existing transaction.
+func (r *pgMerchantAPIKeyRepository) CreateInTx(ctx context.Context, tx pgx.Tx, key *model.MerchantAPIKey) error {
+	return insertMerchantAPIKey(ctx, tx, key)
+}
+
+type merchantAPIKeyExecuter interface {
+	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
+}
+
+func insertMerchantAPIKey(ctx context.Context, db merchantAPIKeyExecuter, key *model.MerchantAPIKey) error {
 	const q = `
 		INSERT INTO merchant_api_keys
 		    (id, merchant_id, key_id, secret_hash, name, status,
 		     last_used_at, expires_at, revoked_at, created_at, updated_at)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
 	`
-	_, err := r.db.Exec(ctx, q,
+	_, err := db.Exec(ctx, q,
 		key.ID,
 		key.MerchantID,
 		key.KeyID,
@@ -167,8 +219,17 @@ func (r *pgMerchantAPIKeyRepository) ListByMerchant(ctx context.Context, merchan
 	return keys, nil
 }
 
-// Revoke transitions a key from ACTIVE → REVOKED.
+// Revoke transitions a key from ACTIVE → REVOKED. When an audit event is
+// attached, the row is locked and the mutation plus event commit atomically.
 func (r *pgMerchantAPIKeyRepository) Revoke(ctx context.Context, merchantID, id uuid.UUID) error {
+	_, hasEvent := audit.EventFromContext(ctx)
+	if hasEvent {
+		if err := audit.RequireRecorder(ctx, r.auditor); err != nil {
+			return err
+		}
+		return r.revokeAudited(ctx, merchantID, id)
+	}
+
 	// First verify the key exists and belongs to the merchant.
 	key, err := r.GetByID(ctx, merchantID, id)
 	if err != nil {
@@ -199,8 +260,63 @@ func (r *pgMerchantAPIKeyRepository) Revoke(ctx context.Context, merchantID, id 
 	return nil
 }
 
+func (r *pgMerchantAPIKeyRepository) revokeAudited(ctx context.Context, merchantID, id uuid.UUID) error {
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("merchant api key repository revoke begin: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+
+	const selectQ = `
+		SELECT status
+		FROM merchant_api_keys
+		WHERE id = $1 AND merchant_id = $2
+		FOR UPDATE
+	`
+	var status model.MerchantAPIKeyStatus
+	if err := tx.QueryRow(ctx, selectQ, id, merchantID).Scan(&status); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrMerchantAPIKeyNotFound
+		}
+		return fmt.Errorf("merchant api key repository revoke select: %w", err)
+	}
+	if status == model.MerchantAPIKeyStatusRevoked {
+		return ErrMerchantAPIKeyAlreadyRevoked
+	}
+
+	now := time.Now().UTC()
+	const updateQ = `
+		UPDATE merchant_api_keys
+		SET status = 'REVOKED', revoked_at = $1, updated_at = $2
+		WHERE id = $3 AND merchant_id = $4 AND status = 'ACTIVE'
+	`
+	tag, err := tx.Exec(ctx, updateQ, now, now, id, merchantID)
+	if err != nil {
+		return fmt.Errorf("merchant api key repository revoke: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrMerchantAPIKeyAlreadyRevoked
+	}
+	if err := audit.RecordInTxIfPresent(ctx, tx, r.auditor); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("merchant api key repository revoke commit: %w", err)
+	}
+	committed = true
+	return nil
+}
+
 // Rotate atomically revokes oldID and inserts newKey within a transaction.
 func (r *pgMerchantAPIKeyRepository) Rotate(ctx context.Context, merchantID, oldID uuid.UUID, newKey *model.MerchantAPIKey) error {
+	if err := audit.RequireRecorder(ctx, r.auditor); err != nil {
+		return err
+	}
 	tx, err := r.db.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("merchant api key repository rotate begin: %w", err)
@@ -252,6 +368,9 @@ func (r *pgMerchantAPIKeyRepository) Rotate(ctx context.Context, merchantID, old
 		return fmt.Errorf("merchant api key repository rotate insert: %w", err)
 	}
 
+	if err := audit.RecordInTxIfPresent(ctx, tx, r.auditor); err != nil {
+		return err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("merchant api key repository rotate commit: %w", err)
 	}

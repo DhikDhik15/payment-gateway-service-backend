@@ -9,6 +9,7 @@ import (
 	"github.com/dhikaarta/pay-gate-backend/internal/model"
 	"github.com/dhikaarta/pay-gate-backend/internal/repository"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 )
 
 // ─── Mock merchant repository (minimal, for DashboardUserService) ─────────────
@@ -29,6 +30,10 @@ func (m *mockMerchantRepo) Create(_ context.Context, merchant *model.Merchant) e
 	return nil
 }
 
+func (m *mockMerchantRepo) CreateInTx(ctx context.Context, _ pgx.Tx, merchant *model.Merchant) error {
+	return m.Create(ctx, merchant)
+}
+
 func (m *mockMerchantRepo) GetByID(_ context.Context, id uuid.UUID) (*model.Merchant, error) {
 	if m.notFoundErr {
 		return nil, repository.ErrMerchantNotFound
@@ -46,6 +51,15 @@ func (m *mockMerchantRepo) GetByAPIKey(_ context.Context, _ string) (*model.Merc
 
 func (m *mockMerchantRepo) ExistsByCode(_ context.Context, _ string) (bool, error) {
 	return false, nil
+}
+
+func (m *mockMerchantRepo) UpdateStatus(_ context.Context, id uuid.UUID, status model.MerchantStatus) error {
+	merchant, ok := m.merchants[id]
+	if !ok {
+		return repository.ErrMerchantNotFound
+	}
+	merchant.Status = status
+	return nil
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────

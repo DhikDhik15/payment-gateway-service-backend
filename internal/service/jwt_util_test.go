@@ -17,6 +17,7 @@ func TestSignAndVerifyJWT(t *testing.T) {
 		IssuedAt:   time.Now().Unix(),
 		ExpiresAt:  time.Now().Add(15 * time.Minute).Unix(),
 		JTI:        "jti-1",
+		SessionID:  "session-1",
 	}
 
 	token, err := signJWT(claims, secret)
@@ -40,6 +41,9 @@ func TestSignAndVerifyJWT(t *testing.T) {
 	}
 	if got.Role != claims.Role {
 		t.Errorf("role: got %q, want %q", got.Role, claims.Role)
+	}
+	if got.SessionID != claims.SessionID {
+		t.Errorf("sessionID: got %q, want %q", got.SessionID, claims.SessionID)
 	}
 }
 

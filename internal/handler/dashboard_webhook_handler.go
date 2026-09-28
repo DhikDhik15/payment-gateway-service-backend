@@ -252,6 +252,8 @@ func (h *DashboardWebhookHandler) handleError(c *gin.Context, err error) {
 	case errors.Is(err, service.ErrWebhookConfigNotFound),
 		errors.Is(err, service.ErrWebhookDeliveryNotFound):
 		response.NotFound(c, response.CodeResourceNotFound, "Resource not found")
+	case errors.Is(err, service.ErrWebhookDestinationBlocked):
+		response.BadRequest(c, response.CodeWebhookDestinationBlocked, "Webhook destination is not allowed")
 	case errors.Is(err, service.ErrWebhookInvalidURL):
 		response.ValidationError(c, map[string]string{"url": "must be a valid https URL"})
 	case errors.Is(err, service.ErrWebhookDeliveryNotRetryable):

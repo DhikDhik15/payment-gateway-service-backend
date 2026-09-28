@@ -150,3 +150,16 @@ type LoginResponse struct {
 type UpdateUserStatusRequest struct {
 	Status DashboardUserStatus `json:"status" binding:"required,oneof=ACTIVE DISABLED"`
 }
+
+// UpdateUserRoleRequest is the input for PATCH /api/v1/dashboard/users/:user_id/role.
+type UpdateUserRoleRequest struct {
+	Role DashboardUserRole `json:"role" binding:"required,oneof=OWNER ADMIN VIEWER"`
+}
+
+// ChangePasswordRequest is the input for PATCH /api/v1/dashboard/me/password.
+// The caller identity is always derived from the authenticated session — user_id
+// is never accepted from the request body.
+type ChangePasswordRequest struct {
+	CurrentPassword string `json:"current_password" binding:"required"`
+	NewPassword     string `json:"new_password"     binding:"required,min=8,max=128"`
+}

@@ -18,30 +18,42 @@ import (
 	"github.com/dhikaarta/pay-gate-backend/pkg/response"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 )
 
 // ─── Mock AuthService ─────────────────────────────────────────────────────────
 
 type mockAuthService struct {
-	loginResp      *model.LoginResponse
-	loginRefresh   string
-	loginErr       error
-	logoutErr      error
-	meResp         *model.DashboardUserResponse
-	meErr          error
-	refreshResp    *model.LoginResponse
-	refreshRefresh string
-	refreshErr     error
-	verifyErr      error
-	verifyClaims   *service.JWTClaims
+	loginResp           *model.LoginResponse
+	loginRefresh        string
+	loginErr            error
+	logoutErr           error
+	logoutSessionErr    error
+	logoutSessionID     uuid.UUID
+	logoutSessionUserID uuid.UUID
+	logoutHashes        []string
+	meResp              *model.DashboardUserResponse
+	meErr               error
+	refreshResp         *model.LoginResponse
+	refreshRefresh      string
+	refreshErr          error
+	verifyErr           error
+	verifyClaims        *service.JWTClaims
 }
 
 func (m *mockAuthService) Login(_ context.Context, _ model.LoginRequest) (*model.LoginResponse, string, error) {
 	return m.loginResp, m.loginRefresh, m.loginErr
 }
 
-func (m *mockAuthService) Logout(_ context.Context, _ string) error {
+func (m *mockAuthService) Logout(_ context.Context, tokenHash string) error {
+	m.logoutHashes = append(m.logoutHashes, tokenHash)
 	return m.logoutErr
+}
+
+func (m *mockAuthService) LogoutSession(_ context.Context, sessionID uuid.UUID, userID uuid.UUID) error {
+	m.logoutSessionID = sessionID
+	m.logoutSessionUserID = userID
+	return m.logoutSessionErr
 }
 
 func (m *mockAuthService) Me(_ context.Context, _ uuid.UUID) (*model.DashboardUserResponse, error) {
@@ -65,6 +77,18 @@ type mockDashboardUserService struct {
 	listErr          error
 	updateStatusResp *model.DashboardUserResponse
 	updateStatusErr  error
+	updateRoleResp   *model.DashboardUserResponse
+	updateRoleErr    error
+	changePassResp   *model.DashboardUserResponse
+	changePassErr    error
+
+	// Phase 8A call recording — used to assert tenant isolation and that the
+	// caller identity always comes from the authenticated context.
+	lastRoleCallerMerchant uuid.UUID
+	lastRoleTarget         uuid.UUID
+	lastRoleBody           model.UpdateUserRoleRequest
+	lastPassCaller         uuid.UUID
+	lastPassBody           model.ChangePasswordRequest
 }
 
 func (m *mockDashboardUserService) CreateUser(_ context.Context, _ uuid.UUID, _ model.CreateDashboardUserRequest) (*model.DashboardUserResponse, error) {
@@ -79,6 +103,19 @@ func (m *mockDashboardUserService) UpdateUserStatus(_ context.Context, _ uuid.UU
 	return m.updateStatusResp, m.updateStatusErr
 }
 
+func (m *mockDashboardUserService) UpdateUserRole(_ context.Context, _ uuid.UUID, _ model.DashboardUserRole, callerMerchantID uuid.UUID, targetUserID uuid.UUID, newRole model.DashboardUserRole) (*model.DashboardUserResponse, error) {
+	m.lastRoleCallerMerchant = callerMerchantID
+	m.lastRoleTarget = targetUserID
+	m.lastRoleBody = model.UpdateUserRoleRequest{Role: newRole}
+	return m.updateRoleResp, m.updateRoleErr
+}
+
+func (m *mockDashboardUserService) ChangePassword(_ context.Context, callerUserID uuid.UUID, req model.ChangePasswordRequest) (*model.DashboardUserResponse, error) {
+	m.lastPassCaller = callerUserID
+	m.lastPassBody = req
+	return m.changePassResp, m.changePassErr
+}
+
 // ─── Mock MerchantUserRepository (for middleware) ─────────────────────────────
 
 type mockUserRepoForMiddleware struct {
@@ -87,6 +124,10 @@ type mockUserRepoForMiddleware struct {
 }
 
 func (m *mockUserRepoForMiddleware) Create(_ context.Context, _ *model.MerchantUser) error {
+	return nil
+}
+
+func (m *mockUserRepoForMiddleware) CreateInTx(_ context.Context, _ pgx.Tx, _ *model.MerchantUser) error {
 	return nil
 }
 
@@ -106,7 +147,56 @@ func (m *mockUserRepoForMiddleware) UpdateStatus(_ context.Context, _ uuid.UUID,
 	return nil
 }
 
+func (m *mockUserRepoForMiddleware) UpdateRole(_ context.Context, _ uuid.UUID, _ model.DashboardUserRole) error {
+	return nil
+}
+
+func (m *mockUserRepoForMiddleware) CountActiveOwners(_ context.Context, _ uuid.UUID) (int, error) {
+	return 0, nil
+}
+
+func (m *mockUserRepoForMiddleware) UpdatePasswordHash(_ context.Context, _ uuid.UUID, _ string) error {
+	return nil
+}
+
 func (m *mockUserRepoForMiddleware) UpdateLastLoginAt(_ context.Context, _ uuid.UUID, _ time.Time) error {
+	return nil
+}
+
+// ─── Mock MerchantRepository (for dashboard auth middleware) ──────────────────
+
+// mockMerchantRepoForMiddleware returns an ACTIVE merchant by default.
+// Override resp/err to simulate suspended or missing merchants in tests.
+type mockMerchantRepoForMiddleware struct {
+	resp *model.Merchant
+	err  error
+}
+
+func newActiveMerchantRepo(merchantID uuid.UUID) *mockMerchantRepoForMiddleware {
+	return &mockMerchantRepoForMiddleware{
+		resp: &model.Merchant{
+			ID:     merchantID,
+			Status: model.MerchantStatusActive,
+		},
+	}
+}
+
+func (m *mockMerchantRepoForMiddleware) Create(_ context.Context, _ *model.Merchant) error {
+	return nil
+}
+func (m *mockMerchantRepoForMiddleware) CreateInTx(_ context.Context, _ pgx.Tx, _ *model.Merchant) error {
+	return nil
+}
+func (m *mockMerchantRepoForMiddleware) GetByID(_ context.Context, _ uuid.UUID) (*model.Merchant, error) {
+	return m.resp, m.err
+}
+func (m *mockMerchantRepoForMiddleware) GetByAPIKey(_ context.Context, _ string) (*model.Merchant, error) {
+	return nil, nil
+}
+func (m *mockMerchantRepoForMiddleware) ExistsByCode(_ context.Context, _ string) (bool, error) {
+	return false, nil
+}
+func (m *mockMerchantRepoForMiddleware) UpdateStatus(_ context.Context, _ uuid.UUID, _ model.MerchantStatus) error {
 	return nil
 }
 
@@ -123,8 +213,13 @@ func newAuthTestRouter(authSvc service.AuthService, userRepo repository.Merchant
 	r.POST("/api/v1/auth/logout", h.Logout)
 	r.POST("/api/v1/auth/refresh", h.Refresh)
 
+	// Derive merchant ID from the user repo's user for the active merchant stub.
+	var merchantID uuid.UUID
+	if mu, ok := userRepo.(*mockUserRepoForMiddleware); ok && mu.user != nil {
+		merchantID = mu.user.MerchantID
+	}
 	protected := r.Group("/api/v1/auth")
-	protected.Use(middleware.RequireDashboardAuth(authSvc, userRepo))
+	protected.Use(middleware.RequireDashboardAuth(authSvc, userRepo, newActiveMerchantRepo(merchantID)))
 	{
 		protected.GET("/me", h.Me)
 	}
@@ -152,15 +247,25 @@ func newDashboardUserTestRouter(authSvc service.AuthService, userRepo repository
 	r := gin.New()
 	r.Use(middleware.RequestID())
 
+	var merchantID uuid.UUID
+	if mu, ok := userRepo.(*mockUserRepoForMiddleware); ok && mu.user != nil {
+		merchantID = mu.user.MerchantID
+	}
+
 	h := handler.NewDashboardUserHandler(userSvc)
 	dashboard := r.Group("/api/v1/dashboard")
-	dashboard.Use(middleware.RequireDashboardAuth(authSvc, userRepo))
+	dashboard.Use(middleware.RequireDashboardAuth(authSvc, userRepo, newActiveMerchantRepo(merchantID)))
 	{
 		dashboard.GET("/users", h.ListUsers)
 		dashboard.PATCH("/users/:user_id/status",
 			middleware.RequireRole(model.DashboardUserRoleOwner),
 			h.UpdateUserStatus,
 		)
+		dashboard.PATCH("/users/:user_id/role",
+			middleware.RequireRole(model.DashboardUserRoleOwner),
+			h.UpdateUserRole,
+		)
+		dashboard.PATCH("/me/password", h.ChangePassword)
 	}
 
 	return r
@@ -334,6 +439,50 @@ func TestAuthHandler_Logout_Success(t *testing.T) {
 		if c.Name == "refresh_token" && c.MaxAge > 0 {
 			t.Error("refresh_token cookie should be cleared (MaxAge <= 0)")
 		}
+	}
+}
+
+func TestAuthHandler_Logout_UsesStableAccessSessionID(t *testing.T) {
+	userID := uuid.New()
+	sessionID := uuid.New()
+	mockSvc := &mockAuthService{
+		verifyClaims: &service.JWTClaims{
+			Subject:   userID.String(),
+			SessionID: sessionID.String(),
+		},
+	}
+	userRepo := &mockUserRepoForMiddleware{}
+
+	r := newAuthTestRouter(mockSvc, userRepo)
+	w := authDoRequest(r, http.MethodPost, "/api/v1/auth/logout", nil, map[string]string{
+		"Authorization":   "Bearer valid.jwt.token",
+		"X-Refresh-Token": "some-token",
+	})
+
+	if authResponseCode(w) != http.StatusOK {
+		t.Fatalf("status: got %d, want 200 — body: %s", w.Code, w.Body.String())
+	}
+	if mockSvc.logoutSessionID != sessionID || mockSvc.logoutSessionUserID != userID {
+		t.Fatalf("session logout identity = (%s,%s), want (%s,%s)", mockSvc.logoutSessionID, mockSvc.logoutSessionUserID, sessionID, userID)
+	}
+	if len(mockSvc.logoutHashes) != 0 {
+		t.Fatalf("valid sid must not invoke refresh-hash fallback; calls = %d", len(mockSvc.logoutHashes))
+	}
+}
+
+func TestAuthHandler_Logout_ExpiredAccessFallsBackToRefreshHash(t *testing.T) {
+	mockSvc := &mockAuthService{verifyErr: service.ErrJWTExpiredPublic}
+	userRepo := &mockUserRepoForMiddleware{}
+	r := newAuthTestRouter(mockSvc, userRepo)
+	w := authDoRequest(r, http.MethodPost, "/api/v1/auth/logout", nil, map[string]string{
+		"Authorization":   "Bearer expired.jwt.token",
+		"X-Refresh-Token": "some-token",
+	})
+	if authResponseCode(w) != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", w.Code)
+	}
+	if len(mockSvc.logoutHashes) != 1 {
+		t.Fatalf("refresh-hash fallback calls = %d, want 1", len(mockSvc.logoutHashes))
 	}
 }
 

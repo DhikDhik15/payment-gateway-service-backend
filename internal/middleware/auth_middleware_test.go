@@ -23,6 +23,9 @@ import (
 type stubMerchantService struct {
 	merchant      *model.Merchant
 	internalError bool
+	// lookups counts GetMerchantByAPIKey calls so tests can prove the legacy
+	// stage rejects BEFORE touching the database (Phase 8D.3 flag gate).
+	lookups int
 }
 
 func (s *stubMerchantService) CreateMerchant(_ context.Context, _ model.CreateMerchantRequest) (*model.CreateMerchantResponse, error) {
@@ -32,6 +35,7 @@ func (s *stubMerchantService) GetMerchant(_ context.Context, _ uuid.UUID) (*mode
 	panic("not used in auth middleware tests")
 }
 func (s *stubMerchantService) GetMerchantByAPIKey(_ context.Context, apiKey string) (*model.Merchant, error) {
+	s.lookups++
 	if s.internalError {
 		return nil, errors.New("database connection lost")
 	}
@@ -39,6 +43,10 @@ func (s *stubMerchantService) GetMerchantByAPIKey(_ context.Context, apiKey stri
 		return s.merchant, nil
 	}
 	return nil, repository.ErrMerchantNotFound
+}
+
+func (s *stubMerchantService) UpdateMerchantStatus(_ context.Context, _ uuid.UUID, _ model.MerchantStatus) (*model.GetMerchantResponse, error) {
+	panic("not used in auth middleware tests")
 }
 
 var _ service.MerchantService = (*stubMerchantService)(nil)
@@ -81,14 +89,15 @@ var _ service.MerchantAPIKeyService = (*stubAPIKeyService)(nil)
 // ─── router factory ───────────────────────────────────────────────────────────
 
 // newAuthTestRouter returns a minimal Gin engine with the Auth middleware.
-// Both merchant and API key services are provided.
-func newAuthTestRouter(t *testing.T, merchantSvc service.MerchantService, apiKeySvc service.MerchantAPIKeyService) *gin.Engine {
+// Both merchant and API key services are provided, along with the Phase 8D.3
+// LEGACY_API_CREDENTIALS_ENABLED position for the legacy stage.
+func newAuthTestRouter(t *testing.T, merchantSvc service.MerchantService, apiKeySvc service.MerchantAPIKeyService, legacyEnabled bool) *gin.Engine {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 
 	r := gin.New()
 	r.Use(middleware.RequestID())
-	r.Use(middleware.Auth(merchantSvc, apiKeySvc))
+	r.Use(middleware.Auth(merchantSvc, apiKeySvc, legacyEnabled))
 
 	r.GET("/protected", func(c *gin.Context) {
 		m := middleware.MerchantFromContext(c)
@@ -99,6 +108,19 @@ func newAuthTestRouter(t *testing.T, merchantSvc service.MerchantService, apiKey
 		c.JSON(http.StatusOK, gin.H{"merchant_id": m.ID.String()})
 	})
 	return r
+}
+
+// legacyMerchant builds an ACTIVE merchant carrying a legacy credential in the
+// given migration state — the fixture every legacy-auth test needs.
+func legacyMerchant(apiKey string, state model.LegacyCredentialState) *model.Merchant {
+	return &model.Merchant{
+		ID:                    uuid.New(),
+		Name:                  "Legacy",
+		Code:                  "LEG",
+		APIKey:                apiKey,
+		Status:                model.MerchantStatusActive,
+		LegacyCredentialState: state,
+	}
 }
 
 // noopAPIKeySvc is used where new-key auth should never trigger
@@ -145,16 +167,31 @@ func getMerchantID(t *testing.T, w *httptest.ResponseRecorder) string {
 	return body["merchant_id"].(string)
 }
 
+// comparableBody returns the response payload with meta.request_id removed so
+// two responses can be compared for oracle leaks. request_id is legitimately
+// unique per request and is not attacker-visible information.
+func comparableBody(t *testing.T, w *httptest.ResponseRecorder) string {
+	t.Helper()
+	var body map[string]any
+	if err := parseJSONBody(w, &body); err != nil {
+		t.Fatalf("parse body: %v\nbody: %s", err, w.Body.String())
+	}
+	delete(body, "meta")
+	out, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	return string(out)
+}
+
 // ─── Legacy authentication tests ─────────────────────────────────────────────
 
-// TestAuth_LegacyKey_Valid ensures a bare legacy api_key works.
+// TestAuth_LegacyKey_Valid ensures a bare legacy api_key works while the
+// migration window is open and the merchant is in an auth-allowed state.
 // Legacy keys use the "pk_" prefix but have NO ":sk_" secret segment.
 func TestAuth_LegacyKey_Valid(t *testing.T) {
-	merchant := &model.Merchant{
-		ID: uuid.New(), Name: "Legacy", Code: "LEG001",
-		APIKey: "pk_legacybarekeyhexvalue", Status: model.MerchantStatusActive,
-	}
-	r := newAuthTestRouter(t, &stubMerchantService{merchant: merchant}, noopAPIKeySvc())
+	merchant := legacyMerchant("pk_legacybarekeyhexvalue", model.LegacyCredentialStateLegacy)
+	r := newAuthTestRouter(t, &stubMerchantService{merchant: merchant}, noopAPIKeySvc(), true)
 
 	w := authRequest(r, "pk_legacybarekeyhexvalue")
 	if w.Code != http.StatusOK {
@@ -168,12 +205,9 @@ func TestAuth_LegacyKey_Valid(t *testing.T) {
 // TestAuth_LegacyKey_PkPrefix_DoesNotEnterNewPath ensures bare "pk_…" legacy
 // credentials are NOT routed into MerchantAPIKeyService.
 func TestAuth_LegacyKey_PkPrefix_DoesNotEnterNewPath(t *testing.T) {
-	merchant := &model.Merchant{
-		ID: uuid.New(), Name: "Legacy", Code: "LEG002",
-		APIKey: "pk_abcdef0123456789", Status: model.MerchantStatusActive,
-	}
+	merchant := legacyMerchant("pk_abcdef0123456789", model.LegacyCredentialStateLegacy)
 	apiKeySvc := &stubAPIKeyService{authErr: service.ErrAPIKeyNotFound}
-	r := newAuthTestRouter(t, &stubMerchantService{merchant: merchant}, apiKeySvc)
+	r := newAuthTestRouter(t, &stubMerchantService{merchant: merchant}, apiKeySvc, true)
 
 	w := authRequest(r, "pk_abcdef0123456789")
 	if w.Code != http.StatusOK {
@@ -186,7 +220,7 @@ func TestAuth_LegacyKey_PkPrefix_DoesNotEnterNewPath(t *testing.T) {
 
 // TestAuth_LegacyKey_Invalid — unknown legacy key → 401.
 func TestAuth_LegacyKey_Invalid(t *testing.T) {
-	r := newAuthTestRouter(t, &stubMerchantService{}, noopAPIKeySvc())
+	r := newAuthTestRouter(t, &stubMerchantService{}, noopAPIKeySvc(), true)
 
 	w := authRequest(r, "legacy_bad_key")
 	if w.Code != http.StatusUnauthorized {
@@ -204,7 +238,7 @@ func TestAuth_NewKey_Valid(t *testing.T) {
 		Status: model.MerchantStatusActive,
 	}
 	apiKeySvc := &stubAPIKeyService{merchant: merchant}
-	r := newAuthTestRouter(t, &stubMerchantService{}, apiKeySvc)
+	r := newAuthTestRouter(t, &stubMerchantService{}, apiKeySvc, true)
 
 	w := authRequest(r, "pk_abc123:sk_secretvalue")
 	if w.Code != http.StatusOK {
@@ -222,7 +256,7 @@ func TestAuth_NewKey_Valid(t *testing.T) {
 func TestAuth_NewKey_Invalid(t *testing.T) {
 	legacySvc := &stubMerchantService{} // would succeed if legacy auth was tried
 	apiKeySvc := &stubAPIKeyService{authErr: service.ErrAPIKeyNotFound}
-	r := newAuthTestRouter(t, legacySvc, apiKeySvc)
+	r := newAuthTestRouter(t, legacySvc, apiKeySvc, true)
 
 	w := authRequest(r, "pk_bad:sk_bad")
 	if w.Code != http.StatusUnauthorized {
@@ -234,7 +268,7 @@ func TestAuth_NewKey_Invalid(t *testing.T) {
 // TestAuth_NewKey_RevokedKey — revoked key → 401.
 func TestAuth_NewKey_RevokedKey(t *testing.T) {
 	apiKeySvc := &stubAPIKeyService{authErr: service.ErrAPIKeyNotFound}
-	r := newAuthTestRouter(t, &stubMerchantService{}, apiKeySvc)
+	r := newAuthTestRouter(t, &stubMerchantService{}, apiKeySvc, true)
 
 	w := authRequest(r, "pk_revoked:sk_secret")
 	if w.Code != http.StatusUnauthorized {
@@ -246,7 +280,7 @@ func TestAuth_NewKey_RevokedKey(t *testing.T) {
 // TestAuth_NewKey_ExpiredKey — expired key → 401.
 func TestAuth_NewKey_ExpiredKey(t *testing.T) {
 	apiKeySvc := &stubAPIKeyService{authErr: service.ErrAPIKeyNotFound}
-	r := newAuthTestRouter(t, &stubMerchantService{}, apiKeySvc)
+	r := newAuthTestRouter(t, &stubMerchantService{}, apiKeySvc, true)
 
 	w := authRequest(r, "pk_expired:sk_secret")
 	if w.Code != http.StatusUnauthorized {
@@ -261,7 +295,7 @@ func TestAuth_NewKey_InactiveMerchant(t *testing.T) {
 		ID: uuid.New(), Status: model.MerchantStatusSuspended,
 	}
 	apiKeySvc := &stubAPIKeyService{merchant: merchant}
-	r := newAuthTestRouter(t, &stubMerchantService{}, apiKeySvc)
+	r := newAuthTestRouter(t, &stubMerchantService{}, apiKeySvc, true)
 
 	w := authRequest(r, "pk_validkey:sk_validSecret")
 	if w.Code != http.StatusUnauthorized {
@@ -282,7 +316,7 @@ func TestAuth_NewKey_DoesNotFallbackToLegacy(t *testing.T) {
 	// New key service returns not-found.
 	apiKeySvc := &stubAPIKeyService{authErr: service.ErrAPIKeyNotFound}
 
-	r := newAuthTestRouter(t, legacySvc, apiKeySvc)
+	r := newAuthTestRouter(t, legacySvc, apiKeySvc, true)
 	w := authRequest(r, "pk_shouldnotfallback:sk_shouldnotfallback")
 
 	// Must be 401 — new-key path is used, fails, and legacy is NOT tried.
@@ -295,7 +329,7 @@ func TestAuth_NewKey_DoesNotFallbackToLegacy(t *testing.T) {
 
 // TestAuth_MissingKey — no X-API-Key header → 401.
 func TestAuth_MissingKey(t *testing.T) {
-	r := newAuthTestRouter(t, &stubMerchantService{}, noopAPIKeySvc())
+	r := newAuthTestRouter(t, &stubMerchantService{}, noopAPIKeySvc(), true)
 	w := authRequest(r, "")
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d", w.Code)
@@ -310,11 +344,11 @@ func TestAuth_InactiveMerchant_Legacy(t *testing.T) {
 		model.MerchantStatusSuspended,
 	} {
 		t.Run(string(status), func(t *testing.T) {
-			merchant := &model.Merchant{
-				ID: uuid.New(), Name: "Inactive", Code: "INA",
-				APIKey: "legacy_inactive_key", Status: status,
-			}
-			r := newAuthTestRouter(t, &stubMerchantService{merchant: merchant}, noopAPIKeySvc())
+			merchant := legacyMerchant("legacy_inactive_key", model.LegacyCredentialStateLegacy)
+			merchant.Name = "Inactive"
+			merchant.Code = "INA"
+			merchant.Status = status
+			r := newAuthTestRouter(t, &stubMerchantService{merchant: merchant}, noopAPIKeySvc(), true)
 
 			w := authRequest(r, "legacy_inactive_key")
 			if w.Code != http.StatusUnauthorized {
@@ -327,7 +361,7 @@ func TestAuth_InactiveMerchant_Legacy(t *testing.T) {
 
 // TestAuth_ServiceInternalError — DB error on legacy lookup → 500.
 func TestAuth_ServiceInternalError(t *testing.T) {
-	r := newAuthTestRouter(t, &stubMerchantService{internalError: true}, noopAPIKeySvc())
+	r := newAuthTestRouter(t, &stubMerchantService{internalError: true}, noopAPIKeySvc(), true)
 
 	w := authRequest(r, "legacy_any_key")
 	if w.Code != http.StatusInternalServerError {
@@ -343,7 +377,7 @@ func TestAuth_RequestAborted(t *testing.T) {
 
 	r := gin.New()
 	r.Use(middleware.RequestID())
-	r.Use(middleware.Auth(&stubMerchantService{}, noopAPIKeySvc()))
+	r.Use(middleware.Auth(&stubMerchantService{}, noopAPIKeySvc(), true))
 	r.GET("/protected", func(c *gin.Context) {
 		called = true
 		c.JSON(http.StatusOK, gin.H{"ok": true})
@@ -393,8 +427,8 @@ func TestAuth_CrossMerchant(t *testing.T) {
 	apiKeySvcA := &stubAPIKeyService{merchant: merchantA}
 	apiKeySvcB := &stubAPIKeyService{merchant: merchantB}
 
-	rA := newAuthTestRouter(t, &stubMerchantService{}, apiKeySvcA)
-	rB := newAuthTestRouter(t, &stubMerchantService{}, apiKeySvcB)
+	rA := newAuthTestRouter(t, &stubMerchantService{}, apiKeySvcA, true)
+	rB := newAuthTestRouter(t, &stubMerchantService{}, apiKeySvcB, true)
 
 	// Merchant A key on router A → Merchant A.
 	wA := authRequest(rA, "pk_keya:sk_secreta")
@@ -419,7 +453,7 @@ func TestAuth_CrossMerchant(t *testing.T) {
 // not called on missing key (so last_used_at not updated on auth failure).
 func TestAuth_NewKey_LastUsedAt_OnlyOnSuccess(t *testing.T) {
 	apiKeySvc := &stubAPIKeyService{authErr: service.ErrAPIKeyNotFound}
-	r := newAuthTestRouter(t, &stubMerchantService{}, apiKeySvc)
+	r := newAuthTestRouter(t, &stubMerchantService{}, apiKeySvc, true)
 
 	// Send a request with no key at all — auth fails before apiKeySvc is called.
 	authRequest(r, "")

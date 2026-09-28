@@ -41,6 +41,37 @@ func TestMidtransProviderCreateAndCancel(t *testing.T) {
 	}
 }
 
+func TestMidtransWebhookParserRejectsMalformedAmountOrCurrency(t *testing.T) {
+	parser := service.NewMidtransWebhookParser("server-key")
+	valid := []byte(`{"transaction_id":"tx-1","order_id":"order-1","transaction_status":"settlement","status_code":"200","gross_amount":"50000","currency":"idr"}`)
+	event, err := parser.ParseEvent(valid)
+	if err != nil {
+		t.Fatalf("valid Midtrans notification rejected: %v", err)
+	}
+	if event.Amount != 50000 || event.Currency != "IDR" {
+		t.Fatalf("parsed amount/currency = %d/%q, want 50000/IDR", event.Amount, event.Currency)
+	}
+
+	cases := []struct {
+		name    string
+		payload string
+		wantErr error
+	}{
+		{name: "non numeric amount", payload: `{"transaction_id":"tx-1","order_id":"order-1","transaction_status":"settlement","status_code":"200","gross_amount":"not-a-number","currency":"IDR"}`, wantErr: service.ErrWebhookMalformedPayload},
+		{name: "zero amount", payload: `{"transaction_id":"tx-1","order_id":"order-1","transaction_status":"settlement","status_code":"200","gross_amount":"0","currency":"IDR"}`, wantErr: service.ErrWebhookMalformedPayload},
+		{name: "missing currency", payload: `{"transaction_id":"tx-1","order_id":"order-1","transaction_status":"settlement","status_code":"200","gross_amount":"50000"}`, wantErr: service.ErrWebhookMissingFields},
+		{name: "missing transaction id", payload: `{"order_id":"order-1","transaction_status":"settlement","status_code":"200","gross_amount":"50000","currency":"IDR"}`, wantErr: service.ErrWebhookMissingFields},
+		{name: "invalid currency", payload: `{"transaction_id":"tx-1","order_id":"order-1","transaction_status":"settlement","status_code":"200","gross_amount":"50000","currency":"US"}`, wantErr: service.ErrWebhookMalformedPayload},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := parser.ParseEvent([]byte(tc.payload)); !errors.Is(err, tc.wantErr) {
+				t.Fatalf("ParseEvent error = %v, want %v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
 func TestMidtransProviderMapsFailureAndTimeout(t *testing.T) {
 	fail := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusTooManyRequests) }))
 	defer fail.Close()

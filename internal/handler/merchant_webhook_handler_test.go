@@ -21,13 +21,17 @@ import (
 
 // stubWebhookCfgSvc is a minimal MerchantWebhookConfigService for isolation tests.
 type stubWebhookCfgSvc struct {
-	owner uuid.UUID
-	cfg   *model.MerchantWebhookConfigResponse
+	owner     uuid.UUID
+	cfg       *model.MerchantWebhookConfigResponse
+	upsertErr error // when set, Upsert returns it (error-mapping tests)
 }
 
 func (s *stubWebhookCfgSvc) Upsert(_ context.Context, merchantID uuid.UUID, _ model.UpsertMerchantWebhookRequest) (*model.MerchantWebhookConfigWithSecretResponse, error) {
 	if merchantID != s.owner {
 		return nil, repository.ErrMerchantNotFound
+	}
+	if s.upsertErr != nil {
+		return nil, s.upsertErr
 	}
 	return &model.MerchantWebhookConfigWithSecretResponse{
 		ID: uuid.New(), MerchantID: merchantID, URL: "https://example.com/hook",
@@ -60,7 +64,7 @@ func (s *stubWebhookCfgSvc) RetryDelivery(context.Context, uuid.UUID, uuid.UUID)
 func TestMerchantWebhookHandler_ForbiddenCrossMerchant(t *testing.T) {
 	owner := uuid.New()
 	other := uuid.New()
-	m := &model.Merchant{ID: owner, APIKey: "pk_test", Status: model.MerchantStatusActive}
+	m := &model.Merchant{ID: owner, APIKey: "pk_test", Status: model.MerchantStatusActive, LegacyCredentialState: model.LegacyCredentialStateLegacy}
 	cfgSvc := &stubWebhookCfgSvc{
 		owner: owner,
 		cfg: &model.MerchantWebhookConfigResponse{
@@ -73,7 +77,7 @@ func TestMerchantWebhookHandler_ForbiddenCrossMerchant(t *testing.T) {
 	r.Use(middleware.RequestID())
 	merchantSvc := &stubMerchantSvc{merchant: m}
 	grp := r.Group("/api/v1/merchants/:id/webhook")
-	grp.Use(middleware.Auth(merchantSvc, nil))
+	grp.Use(middleware.Auth(merchantSvc, nil, true))
 	grp.GET("", h.GetWebhook)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/merchants/"+other.String()+"/webhook", nil)
@@ -87,13 +91,13 @@ func TestMerchantWebhookHandler_ForbiddenCrossMerchant(t *testing.T) {
 
 func TestMerchantWebhookHandler_CreateReturnsSecretOnce(t *testing.T) {
 	owner := uuid.New()
-	m := &model.Merchant{ID: owner, APIKey: "pk_test", Status: model.MerchantStatusActive}
+	m := &model.Merchant{ID: owner, APIKey: "pk_test", Status: model.MerchantStatusActive, LegacyCredentialState: model.LegacyCredentialStateLegacy}
 	cfgSvc := &stubWebhookCfgSvc{owner: owner}
 	h := handler.NewMerchantWebhookHandler(cfgSvc)
 	r := gin.New()
 	r.Use(middleware.RequestID())
 	grp := r.Group("/api/v1/merchants/:id/webhook")
-	grp.Use(middleware.Auth(&stubMerchantSvc{merchant: m}, nil))
+	grp.Use(middleware.Auth(&stubMerchantSvc{merchant: m}, nil, true))
 	grp.POST("", h.UpsertWebhook)
 
 	body := []byte(`{"url":"https://merchant.example.com/webhooks/payment"}`)
@@ -111,6 +115,41 @@ func TestMerchantWebhookHandler_CreateReturnsSecretOnce(t *testing.T) {
 	_ = json.Unmarshal(w.Body.Bytes(), &env)
 	if env.Data["secret"] != "whsec_once" {
 		t.Fatalf("expected secret once, got %#v", env.Data["secret"])
+	}
+}
+
+// Phase 8D.2: service-level destination rejections map to the stable
+// WEBHOOK_DESTINATION_BLOCKED error code (400), without network detail.
+func TestMerchantWebhookHandler_DestinationBlockedMapsToStableCode(t *testing.T) {
+	owner := uuid.New()
+	m := &model.Merchant{ID: owner, APIKey: "pk_test", Status: model.MerchantStatusActive, LegacyCredentialState: model.LegacyCredentialStateLegacy}
+	cfgSvc := &stubWebhookCfgSvc{owner: owner, upsertErr: service.ErrWebhookDestinationBlocked}
+	h := handler.NewMerchantWebhookHandler(cfgSvc)
+	r := gin.New()
+	r.Use(middleware.RequestID())
+	grp := r.Group("/api/v1/merchants/:id/webhook")
+	grp.Use(middleware.Auth(&stubMerchantSvc{merchant: m}, nil, true))
+	grp.POST("", h.UpsertWebhook)
+
+	body := []byte(`{"url":"http://169.254.169.254/latest/meta-data"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/merchants/"+owner.String()+"/webhook", bytes.NewReader(body))
+	req.Header.Set("X-API-Key", "pk_test")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s, want 400", w.Code, w.Body.String())
+	}
+	var env struct {
+		Success bool `json:"success"`
+		Error   struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &env)
+	if env.Success || env.Error.Code != "WEBHOOK_DESTINATION_BLOCKED" {
+		t.Fatalf("envelope=%+v, want success=false code=WEBHOOK_DESTINATION_BLOCKED", env)
 	}
 }
 

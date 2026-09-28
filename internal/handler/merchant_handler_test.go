@@ -1,10 +1,15 @@
 package handler_test
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/dhikaarta/pay-gate-backend/internal/handler"
 	"github.com/dhikaarta/pay-gate-backend/internal/middleware"
@@ -14,6 +19,7 @@ import (
 	"github.com/dhikaarta/pay-gate-backend/pkg/response"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 )
 
 // ─── In-memory merchant repository ───────────────────────────────────────────
@@ -39,6 +45,10 @@ func (r *memMerchantRepo) Create(_ context.Context, m *model.Merchant) error {
 	return nil
 }
 
+func (r *memMerchantRepo) CreateInTx(ctx context.Context, _ pgx.Tx, m *model.Merchant) error {
+	return r.Create(ctx, m)
+}
+
 func (r *memMerchantRepo) GetByID(_ context.Context, id uuid.UUID) (*model.Merchant, error) {
 	m, ok := r.byID[id]
 	if !ok {
@@ -57,6 +67,10 @@ func (r *memMerchantRepo) GetByAPIKey(_ context.Context, apiKey string) (*model.
 
 func (r *memMerchantRepo) ExistsByCode(_ context.Context, code string) (bool, error) {
 	return r.codes[code], nil
+}
+
+func (r *memMerchantRepo) UpdateStatus(_ context.Context, _ uuid.UUID, _ model.MerchantStatus) error {
+	return nil
 }
 
 // ─── erroring repo — forces service to return an internal error ──────────────
@@ -79,55 +93,124 @@ func newMerchantTestRouter(t *testing.T, repo repository.MerchantRepository) *gi
 	r := gin.New()
 	r.Use(middleware.RequestID())
 
-	r.POST("/api/v1/merchants", h.Create)
+	// POST create is admin-protected (matches production wiring).
+	r.POST("/api/v1/merchants", middleware.AdminAuth("test-admin-key"), h.Create)
 	r.GET("/api/v1/merchants/:id", h.GetByID)
 	return r
 }
 
+func doMerchantAdminRequest(r *gin.Engine, method, url string, body any) *httptest.ResponseRecorder {
+	return doMerchantRequest(r, method, url, body, map[string]string{"X-Admin-Key": "test-admin-key"})
+}
+
+func doMerchantRequest(r *gin.Engine, method, url string, body any, headers map[string]string) *httptest.ResponseRecorder {
+	var buf bytes.Buffer
+	if body != nil {
+		_ = json.NewEncoder(&buf).Encode(body)
+	}
+	req, _ := http.NewRequest(method, url, &buf)
+	req.Header.Set("Content-Type", "application/json")
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	return w
+}
+
 // ─── POST /api/v1/merchants ───────────────────────────────────────────────────
 
-func TestCreateMerchantHandler_Success(t *testing.T) {
+// TestCreateMerchantHandler_Frozen_CreationDisabled is the Phase 8D.3 freeze
+// test: creation of new legacy plaintext credentials always fails with
+// 409 LEGACY_CREDENTIAL_CREATION_DISABLED and writes nothing.
+func TestCreateMerchantHandler_Frozen_CreationDisabled(t *testing.T) {
 	repo := newMemMerchantRepo()
 	r := newMerchantTestRouter(t, repo)
 
-	w := doRequest(r, "POST", "/api/v1/merchants", map[string]any{
+	w := doMerchantAdminRequest(r, "POST", "/api/v1/merchants", map[string]any{
 		"name": "Toko Maju",
 		"code": "TOKO001",
 	})
 
-	if w.Code != http.StatusCreated {
-		t.Fatalf("expected 201, got %d\nbody: %s", w.Code, w.Body)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409 (frozen), got %d\nbody: %s", w.Code, w.Body)
 	}
 
 	body := parseBody(t, w)
-
-	// Response envelope must signal success.
-	if body["success"] != true {
-		t.Error("expected success:true")
+	if body["success"] != false {
+		t.Error("expected success:false")
 	}
-	// data.api_key must be non-empty (returned only at creation time).
-	if getStr(t, body, "data", "api_key") == "" {
-		t.Error("expected non-empty api_key in response")
+	if getStr(t, body, "error", "code") != string(response.CodeLegacyCredentialCreationDisabled) {
+		t.Errorf("expected LEGACY_CREDENTIAL_CREATION_DISABLED, got %s",
+			getStr(t, body, "error", "code"))
 	}
-	// data.id must be a valid UUID.
-	idStr := getStr(t, body, "data", "id")
-	if _, err := uuid.Parse(idStr); err != nil {
-		t.Errorf("data.id is not a valid UUID: %s", idStr)
-	}
-	// data.status must be ACTIVE.
-	if getStr(t, body, "data", "status") != string(model.MerchantStatusActive) {
-		t.Errorf("expected status ACTIVE, got %s", getStr(t, body, "data", "status"))
-	}
-	// meta.request_id must be present.
+	// meta.request_id must still be present on error envelopes.
 	if getStr(t, body, "meta", "request_id") == "" {
 		t.Error("expected non-empty request_id in meta")
+	}
+	// Nothing may be persisted: the freeze short-circuits before any write.
+	if exists, err := repo.ExistsByCode(context.Background(), "TOKO001"); err != nil || exists {
+		t.Errorf("expected no merchant row created (exists=%v err=%v)", exists, err)
+	}
+	// No credential material of any kind may leak back to the client.
+	raw := w.Body.String()
+	for _, leak := range []string{"api_key", "api_secret", "pk_", "sk_"} {
+		if strings.Contains(raw, leak) {
+			t.Errorf("frozen response must not contain %q: %s", leak, raw)
+		}
+	}
+}
+
+// TestCreateMerchantHandler_Frozen_PrecedesDuplicateCheck proves the freeze is
+// evaluated BEFORE the duplicate-code check: an existing code yields the stable
+// freeze error, never DUPLICATE_MERCHANT_CODE.
+func TestCreateMerchantHandler_Frozen_PrecedesDuplicateCheck(t *testing.T) {
+	repo := newMemMerchantRepo()
+	r := newMerchantTestRouter(t, repo)
+
+	// Pre-seed a merchant so the code is already taken.
+	seeded := &model.Merchant{
+		ID: uuid.New(), Name: "Existing", Code: "DUP001",
+		APIKey: "pk_existing", Status: model.MerchantStatusActive,
+		LegacyCredentialState: model.LegacyCredentialStateLegacy,
+	}
+	if err := repo.Create(context.Background(), seeded); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	w := doMerchantAdminRequest(r, "POST", "/api/v1/merchants", map[string]any{
+		"name": "Toko A", "code": "DUP001",
+	})
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409, got %d\nbody: %s", w.Code, w.Body)
+	}
+	if code := getStr(t, parseBody(t, w), "error", "code"); code != string(response.CodeLegacyCredentialCreationDisabled) {
+		t.Errorf("expected LEGACY_CREDENTIAL_CREATION_DISABLED (freeze first), got %s", code)
+	}
+}
+
+// TestCreateMerchantHandler_Frozen_PrecedesRepoAccess proves the freeze
+// short-circuits before touching the repository at all — a repo that errors
+// on every call still produces 409, never 500.
+func TestCreateMerchantHandler_Frozen_PrecedesRepoAccess(t *testing.T) {
+	r := newMerchantTestRouter(t, &errorMerchantRepo{})
+
+	w := doMerchantAdminRequest(r, "POST", "/api/v1/merchants", map[string]any{
+		"name": "Toko Error",
+		"code": "ERR001",
+	})
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409 (freeze short-circuits), got %d\nbody: %s", w.Code, w.Body)
+	}
+	if code := getStr(t, parseBody(t, w), "error", "code"); code != string(response.CodeLegacyCredentialCreationDisabled) {
+		t.Errorf("expected LEGACY_CREDENTIAL_CREATION_DISABLED, got %s", code)
 	}
 }
 
 func TestCreateMerchantHandler_ValidationError_MissingName(t *testing.T) {
 	r := newMerchantTestRouter(t, newMemMerchantRepo())
 
-	w := doRequest(r, "POST", "/api/v1/merchants", map[string]any{
+	w := doMerchantAdminRequest(r, "POST", "/api/v1/merchants", map[string]any{
 		"code": "TOKO002",
 	})
 
@@ -143,7 +226,7 @@ func TestCreateMerchantHandler_ValidationError_MissingName(t *testing.T) {
 func TestCreateMerchantHandler_ValidationError_MissingCode(t *testing.T) {
 	r := newMerchantTestRouter(t, newMemMerchantRepo())
 
-	w := doRequest(r, "POST", "/api/v1/merchants", map[string]any{
+	w := doMerchantAdminRequest(r, "POST", "/api/v1/merchants", map[string]any{
 		"name": "Toko Maju",
 	})
 
@@ -158,7 +241,7 @@ func TestCreateMerchantHandler_ValidationError_MissingCode(t *testing.T) {
 func TestCreateMerchantHandler_ValidationError_ShortName(t *testing.T) {
 	r := newMerchantTestRouter(t, newMemMerchantRepo())
 
-	w := doRequest(r, "POST", "/api/v1/merchants", map[string]any{
+	w := doMerchantAdminRequest(r, "POST", "/api/v1/merchants", map[string]any{
 		"name": "X", // min=2
 		"code": "TOKO003",
 	})
@@ -171,42 +254,19 @@ func TestCreateMerchantHandler_ValidationError_ShortName(t *testing.T) {
 	}
 }
 
-func TestCreateMerchantHandler_DuplicateCode(t *testing.T) {
-	repo := newMemMerchantRepo()
-	r := newMerchantTestRouter(t, repo)
+func TestCreateMerchantHandler_Unauthorized(t *testing.T) {
+	r := newMerchantTestRouter(t, newMemMerchantRepo())
 
-	body := map[string]any{"name": "Toko A", "code": "DUP001"}
+	w := doMerchantRequest(r, "POST", "/api/v1/merchants", map[string]any{
+		"name": "Toko Maju",
+		"code": "TOKOUNAUTH",
+	}, nil)
 
-	// First registration must succeed.
-	w1 := doRequest(r, "POST", "/api/v1/merchants", body)
-	if w1.Code != http.StatusCreated {
-		t.Fatalf("first create: expected 201, got %d", w1.Code)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d\nbody: %s", w.Code, w.Body)
 	}
-
-	// Second registration with the same code must return 409.
-	w2 := doRequest(r, "POST", "/api/v1/merchants", body)
-	if w2.Code != http.StatusConflict {
-		t.Fatalf("duplicate: expected 409, got %d\nbody: %s", w2.Code, w2.Body)
-	}
-	if getStr(t, parseBody(t, w2), "error", "code") != string(response.CodeDuplicateMerchantCode) {
-		t.Error("expected DUPLICATE_MERCHANT_CODE")
-	}
-}
-
-func TestCreateMerchantHandler_InternalError(t *testing.T) {
-	// Use a repo that blows up on ExistsByCode.
-	r := newMerchantTestRouter(t, &errorMerchantRepo{})
-
-	w := doRequest(r, "POST", "/api/v1/merchants", map[string]any{
-		"name": "Toko Error",
-		"code": "ERR001",
-	})
-
-	if w.Code != http.StatusInternalServerError {
-		t.Fatalf("expected 500, got %d\nbody: %s", w.Code, w.Body)
-	}
-	if getStr(t, parseBody(t, w), "error", "code") != string(response.CodeInternalError) {
-		t.Error("expected INTERNAL_ERROR")
+	if getStr(t, parseBody(t, w), "error", "code") != string(response.CodeAdminUnauthorized) {
+		t.Error("expected ADMIN_UNAUTHORIZED")
 	}
 }
 
@@ -216,15 +276,21 @@ func TestGetMerchantHandler_Success(t *testing.T) {
 	repo := newMemMerchantRepo()
 	r := newMerchantTestRouter(t, repo)
 
-	// Create a merchant first.
-	w := doRequest(r, "POST", "/api/v1/merchants", map[string]any{
-		"name": "Warung Jaya",
-		"code": "WJ001",
-	})
-	if w.Code != http.StatusCreated {
-		t.Fatalf("setup: expected 201, got %d", w.Code)
+	// Seed directly: POST /merchants is frozen since Phase 8D.3, so the
+	// repository is the only way to place a merchant row in the fixture.
+	now := time.Now().UTC()
+	seeded := &model.Merchant{
+		ID: uuid.New(), Name: "Warung Jaya", Code: "WJ001",
+		APIKey: "pk_wj001", APISecret: "hashed",
+		Status:                model.MerchantStatusActive,
+		LegacyCredentialState: model.LegacyCredentialStateLegacy,
+		CreatedAt:             now,
+		UpdatedAt:             now,
 	}
-	idStr := getStr(t, parseBody(t, w), "data", "id")
+	if err := repo.Create(context.Background(), seeded); err != nil {
+		t.Fatalf("seed merchant: %v", err)
+	}
+	idStr := seeded.ID.String()
 
 	// Fetch by ID.
 	wGet := doRequest(r, "GET", "/api/v1/merchants/"+idStr, nil)
@@ -242,11 +308,25 @@ func TestGetMerchantHandler_Success(t *testing.T) {
 	if getStr(t, body, "data", "code") != "WJ001" {
 		t.Errorf("code mismatch: got %s", getStr(t, body, "data", "code"))
 	}
-	// api_key must NOT appear in the GET response (security requirement).
-	if data, ok := body["data"].(map[string]any); ok {
-		if _, hasKey := data["api_key"]; hasKey {
-			t.Error("api_key must not be returned by GET /merchants/:id")
+	// Phase 8D.3: the migration state IS exposed (it is a label, not a secret).
+	if getStr(t, body, "data", "legacy_credential_state") != string(model.LegacyCredentialStateLegacy) {
+		t.Errorf("expected legacy_credential_state LEGACY, got %s",
+			getStr(t, body, "data", "legacy_credential_state"))
+	}
+	// api_key / api_secret must NEVER appear in the GET response.
+	data, ok := body["data"].(map[string]any)
+	if !ok {
+		t.Fatalf("data is not an object: %v", body["data"])
+	}
+	for _, secret := range []string{"api_key", "api_secret", "secret", "key_id"} {
+		if _, has := data[secret]; has {
+			t.Errorf("%q must not be returned by GET /merchants/:id", secret)
 		}
+	}
+	// Belt and braces: no raw credential material anywhere in the payload.
+	raw := wGet.Body.String()
+	if strings.Contains(raw, "pk_wj001") || strings.Contains(raw, "hashed") {
+		t.Errorf("GET response leaks credential material: %s", raw)
 	}
 }
 

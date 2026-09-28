@@ -321,6 +321,8 @@ func (h *SettlementHandler) mapError(c *gin.Context, err error) {
 		response.NotFound(c, response.CodeSettlementNotFound, "Settlement not found")
 	case errors.Is(err, service.ErrReconciliationNotFound):
 		response.NotFound(c, response.CodeReconciliationNotFound, "Reconciliation result not found")
+	case errors.Is(err, service.ErrSettlementProviderUnsupported):
+		response.ServiceUnavailable(c, response.CodeSettlementImportFailed, "Settlement provider is not configured")
 	case errors.Is(err, service.ErrSettlementImportInvalid), errors.Is(err, service.ErrUnknownSettlementProvider):
 		response.BadRequest(c, response.CodeSettlementImportInvalid, strings.TrimPrefix(err.Error(), "settlement import invalid: "))
 	case errors.Is(err, service.ErrSettlementAlreadyExists):

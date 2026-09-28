@@ -11,6 +11,7 @@ import (
 	"github.com/dhikaarta/pay-gate-backend/internal/service"
 	"github.com/dhikaarta/pay-gate-backend/pkg/response"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
 
 const refreshTokenCookie = "refresh_token"
@@ -96,8 +97,9 @@ func (h *AuthHandler) Login(c *gin.Context) {
 // Logout godoc
 //
 //	@Summary		Dashboard logout
-//	@Description	Revokes the current session. The HttpOnly refresh_token cookie is cleared.
-//	@Description	Accepts the refresh token from the HttpOnly cookie or X-Refresh-Token header.
+//	@Description	Revokes the current refresh session. The HttpOnly refresh_token cookie is cleared.
+//	@Description	When a valid Bearer access token is supplied, its stable sid claim is also used to revoke the exact session atomically, including during refresh rotation.
+//	@Description	An already-issued access JWT remains valid until its exp under the bounded stateless access-token contract.
 //	@Tags			Dashboard Auth
 //	@Produce		json
 //	@Success		200	{object}	object	"Empty object"
@@ -105,8 +107,37 @@ func (h *AuthHandler) Login(c *gin.Context) {
 //	@Router			/api/v1/auth/logout [post]
 //	@Security		BearerAuth
 func (h *AuthHandler) Logout(c *gin.Context) {
-	plainRefresh := refreshTokenFromRequest(c)
+	// Prefer the signed access-token session identity when present. The sid is
+	// stable across refresh rotation, so a concurrent refresh cannot leave a
+	// replacement session behind. Legacy/header-only callers still use the
+	// refresh-hash path below.
+	if accessToken := bearerTokenFromRequest(c); accessToken != "" {
+		if claims, err := h.authSvc.VerifyAccessToken(accessToken); err == nil && claims.SessionID != "" {
+			sessionID, sidErr := uuid.Parse(claims.SessionID)
+			userID, userErr := uuid.Parse(claims.Subject)
+			if sidErr == nil && userErr == nil {
+				if err := h.authSvc.LogoutSession(c.Request.Context(), sessionID, userID); err != nil {
+					slog.Error("dashboard auth: logout session error",
+						slog.String("request_id", c.GetString(response.ContextKey)),
+						slog.String("error", err.Error()),
+						// token/session identifiers are NEVER logged
+					)
+					response.InternalServerError(c)
+					return
+				}
+				// A valid sid is authoritative. Do not also revoke by the
+				// cookie hash: a stale bearer and a browser cookie can belong
+				// to different logical sessions during account switching.
+				h.clearRefreshCookie(c)
+				response.OK(c, gin.H{})
+				return
+			}
+		}
+	}
 
+	// Legacy/header-only callers fall back to the refresh-token hash. The
+	// stable-sid path above is the race-safe path for current dashboard clients.
+	plainRefresh := refreshTokenFromRequest(c)
 	if plainRefresh != "" {
 		tokenHash := service.HashRefreshTokenPublic(plainRefresh)
 		if err := h.authSvc.Logout(c.Request.Context(), tokenHash); err != nil {
@@ -164,7 +195,7 @@ func (h *AuthHandler) Me(c *gin.Context) {
 //
 //	@Summary		Refresh access token
 //	@Description	Issues a new short-lived access token using the HttpOnly refresh_token cookie.
-//	@Description	The old session is rotated (revoked and replaced with a new one).
+//	@Description	CAS-rotates the refresh hash on the same logical session row; the stable sid remains unchanged.
 //	@Tags			Dashboard Auth
 //	@Produce		json
 //	@Success		200	{object}	model.LoginResponse
@@ -224,6 +255,18 @@ func (h *AuthHandler) clearRefreshCookie(c *gin.Context) {
 }
 
 // ─── context helpers ──────────────────────────────────────────────────────────
+
+// bearerTokenFromRequest extracts an Authorization bearer token for logout.
+// Logout remains unauthenticated as an endpoint, but a valid token gives the
+// handler a stable session identity for refresh/logout race serialization.
+func bearerTokenFromRequest(c *gin.Context) string {
+	header := strings.TrimSpace(c.GetHeader("Authorization"))
+	const prefix = "Bearer "
+	if !strings.HasPrefix(header, prefix) {
+		return ""
+	}
+	return strings.TrimSpace(strings.TrimPrefix(header, prefix))
+}
 
 // refreshTokenFromRequest reads the plaintext refresh token from the HttpOnly
 // cookie first, then falls back to X-Refresh-Token header for non-browser clients.

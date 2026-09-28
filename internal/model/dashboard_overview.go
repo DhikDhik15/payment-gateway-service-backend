@@ -72,4 +72,9 @@ type DashboardMerchantSettingsResponse struct {
 	Status    MerchantStatus `json:"status"`
 	CreatedAt time.Time      `json:"created_at"`
 	UpdatedAt time.Time      `json:"updated_at"`
+	// LegacyCredentialState (Phase 8D.3) lets the dashboard prompt for
+	// migration; it is a state label, not a credential.
+	LegacyCredentialState LegacyCredentialState `json:"legacy_credential_state"`
+	// LegacyCredentialDisabledAt is set once the legacy credential is disabled.
+	LegacyCredentialDisabledAt *time.Time `json:"legacy_credential_disabled_at,omitempty"`
 }

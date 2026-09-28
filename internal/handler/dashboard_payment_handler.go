@@ -140,6 +140,7 @@ func (h *DashboardPaymentHandler) GetPayment(c *gin.Context) {
 //	@Failure		404				{object}	response.errorEnvelope
 //	@Failure		409				{object}	response.errorEnvelope
 //	@Failure		500				{object}	response.errorEnvelope
+//	@Failure		503				{object}	response.errorEnvelope
 //	@Router			/api/v1/dashboard/payments/{payment_id}/refunds [post]
 func (h *DashboardPaymentHandler) CreateRefund(c *gin.Context) {
 	caller := dashboardUserFromContext(c)
@@ -397,6 +398,8 @@ func (h *DashboardPaymentHandler) handleRefundError(c *gin.Context, err error) {
 		response.Conflict(c, response.CodeIdempotencyKeyReused, "Idempotency key reused with a different request payload")
 	case errors.Is(err, service.ErrIdempotencyInProgress):
 		response.Conflict(c, response.CodeIdempotencyInProgress, "A request with this idempotency key is already in progress")
+	case errors.Is(err, service.ErrRefundProviderUnsupported):
+		response.ServiceUnavailable(c, response.CodeRefundProviderError, "Refund provider is not configured")
 	case errors.Is(err, service.ErrProviderFailure):
 		response.BadGateway(c, response.CodeRefundProviderError, "Refund provider rejected the request")
 	case errors.Is(err, service.ErrProviderTimeout):

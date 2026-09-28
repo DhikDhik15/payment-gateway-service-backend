@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/dhikaarta/pay-gate-backend/internal/model"
@@ -15,11 +16,12 @@ import (
 )
 
 var (
-	ErrRefundNotFound           = errors.New("refund not found")
-	ErrRefundNotAllowed         = errors.New("refund not allowed")
-	ErrRefundAmountExceeded     = errors.New("refund amount exceeded")
-	ErrRefundTransactionNotPaid = errors.New("refund transaction not paid")
-	ErrRefundCurrencyMismatch   = errors.New("refund currency mismatch")
+	ErrRefundNotFound            = errors.New("refund not found")
+	ErrRefundNotAllowed          = errors.New("refund not allowed")
+	ErrRefundAmountExceeded      = errors.New("refund amount exceeded")
+	ErrRefundTransactionNotPaid  = errors.New("refund transaction not paid")
+	ErrRefundCurrencyMismatch    = errors.New("refund currency mismatch")
+	ErrRefundProviderUnsupported = errors.New("refund provider is not configured")
 )
 
 type RefundService interface {
@@ -39,13 +41,14 @@ type ListRefundsResult struct {
 }
 
 type refundService struct {
-	txRepo         repository.TransactionRepository
-	refundRepo     repository.RefundRepository
-	attemptRepo    repository.RefundAttemptRepository
-	idempotency    repository.IdempotencyKeyRepository
-	provider       RefundProvider
-	publisher      MerchantWebhookPublisher
-	idempotencyTTL time.Duration
+	txRepo             repository.TransactionRepository
+	refundRepo         repository.RefundRepository
+	attemptRepo        repository.RefundAttemptRepository
+	idempotency        repository.IdempotencyKeyRepository
+	provider           RefundProvider
+	publisher          MerchantWebhookPublisher
+	idempotencyTTL     time.Duration
+	configuredProvider string
 }
 
 func NewRefundService(
@@ -56,11 +59,16 @@ func NewRefundService(
 	provider RefundProvider,
 	publisher MerchantWebhookPublisher,
 	idempotencyTTL time.Duration,
+	configuredProvider ...string,
 ) RefundService {
+	providerName := ""
+	if len(configuredProvider) > 0 {
+		providerName = strings.ToLower(strings.TrimSpace(configuredProvider[0]))
+	}
 	return &refundService{
 		txRepo: txRepo, refundRepo: refundRepo, attemptRepo: attemptRepo,
 		idempotency: idempotency, provider: provider, publisher: publisher,
-		idempotencyTTL: idempotencyTTL,
+		idempotencyTTL: idempotencyTTL, configuredProvider: providerName,
 	}
 }
 
@@ -74,6 +82,13 @@ func (s *refundService) outboxHook() repository.RefundOutboxHook {
 }
 
 func (s *refundService) CreateRefundWithIdempotency(ctx context.Context, merchantID, transactionID uuid.UUID, req model.CreateRefundRequest, key string) (*model.RefundResponse, error) {
+	// The current application has a real payment adapter selection but only a
+	// mock refund adapter. Never reserve a local refund or call the mock for a
+	// non-mock production provider; a real provider adapter must be wired before
+	// this capability is enabled.
+	if s.configuredProvider != "" && !strings.EqualFold(s.configuredProvider, mockProviderName) {
+		return nil, ErrRefundProviderUnsupported
+	}
 	if s.idempotency == nil {
 		return s.createRefund(ctx, merchantID, transactionID, req, nil)
 	}

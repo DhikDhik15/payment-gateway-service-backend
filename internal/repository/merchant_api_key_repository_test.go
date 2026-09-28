@@ -11,6 +11,7 @@ import (
 	"github.com/dhikaarta/pay-gate-backend/internal/model"
 	"github.com/dhikaarta/pay-gate-backend/internal/repository"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 )
 
 // ─── In-memory MerchantAPIKeyRepository ───────────────────────────────────────
@@ -59,6 +60,9 @@ func (r *memAPIKeyRepo) Create(_ context.Context, key *model.MerchantAPIKey) err
 	r.byID[key.ID] = stored
 	r.byKeyID[key.KeyID] = stored
 	return nil
+}
+func (r *memAPIKeyRepo) CreateInTx(ctx context.Context, _ pgx.Tx, key *model.MerchantAPIKey) error {
+	return r.Create(ctx, key)
 }
 
 func (r *memAPIKeyRepo) GetByID(_ context.Context, merchantID, id uuid.UUID) (*model.MerchantAPIKey, error) {

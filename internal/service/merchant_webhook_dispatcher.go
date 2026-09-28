@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/dhikaarta/pay-gate-backend/internal/model"
 	"github.com/dhikaarta/pay-gate-backend/internal/repository"
+	"github.com/dhikaarta/pay-gate-backend/internal/ssrf"
 )
 
 // Default retry backoff schedule (attempt number → delay before next attempt).
@@ -51,6 +53,14 @@ type merchantWebhookDispatcher struct {
 }
 
 // NewMerchantWebhookDispatcher constructs the HTTP delivery dispatcher.
+//
+// client is the outbound HTTP client. Passing nil builds the Phase 8D.2
+// SSRF-guarded default (ssrf.NewHTTPClient): destination validation at the
+// dial boundary (DNS-rebinding safe), no environment HTTP(S)_PROXY, redirects
+// refused, TLS verification untouched. An injected client takes over those
+// responsibilities for the caller — the same convention as
+// NewMidtransProvider (tests inject a plain client to reach loopback
+// httptest servers; production always passes nil).
 func NewMerchantWebhookDispatcher(
 	deliveryRepo repository.MerchantWebhookDeliveryRepository,
 	configRepo repository.MerchantWebhookConfigRepository,
@@ -59,6 +69,7 @@ func NewMerchantWebhookDispatcher(
 	maxAttempts int,
 	staleAfter time.Duration,
 	batchSize int,
+	client *http.Client,
 ) MerchantWebhookDispatcher {
 	if timeout <= 0 {
 		timeout = 10 * time.Second
@@ -72,20 +83,17 @@ func NewMerchantWebhookDispatcher(
 	if batchSize <= 0 {
 		batchSize = 20
 	}
+	if client == nil {
+		client = ssrf.NewHTTPClient(timeout, nil)
+	}
 	return &merchantWebhookDispatcher{
 		deliveryRepo: deliveryRepo,
 		configRepo:   configRepo,
 		encKey:       encKey,
-		httpClient: &http.Client{
-			Timeout: timeout,
-			// Do not follow redirects for webhook delivery (security).
-			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
-		},
-		maxAttempts: maxAttempts,
-		staleAfter:  staleAfter,
-		batchSize:   batchSize,
+		httpClient:   client,
+		maxAttempts:  maxAttempts,
+		staleAfter:   staleAfter,
+		batchSize:    batchSize,
 	}
 }
 
@@ -100,7 +108,7 @@ func (d *merchantWebhookDispatcher) ProcessBatch(ctx context.Context) (int, erro
 			slog.Error("merchant webhook delivery error",
 				slog.String("delivery_id", delivery.ID.String()),
 				slog.String("event_id", delivery.EventID),
-				slog.String("error", err.Error()),
+				slog.String("failure", "delivery_failed"),
 			)
 			continue
 		}
@@ -112,9 +120,27 @@ func (d *merchantWebhookDispatcher) ProcessBatch(ctx context.Context) (int, erro
 func (d *merchantWebhookDispatcher) deliverOne(ctx context.Context, delivery *model.MerchantWebhookDelivery) error {
 	attempt := delivery.AttemptCount + 1
 
+	// Phase 8D.2 (SSRF): re-validate the STORED endpoint on every delivery —
+	// the row may predate the destination policy (legacy configuration) or
+	// may have been changed out of band. A policy violation never reaches the
+	// network and fails permanently with a SAFE diagnostic (no resolved
+	// addresses, no resolver output, no internal detail). The guarded dialer
+	// enforces the same policy again at connection time, where DNS is
+	// actually resolved (DNS rebinding / changed DNS).
+	if err := ssrf.ValidateURL(delivery.EndpointURL); err != nil {
+		slog.Warn("merchant webhook destination rejected",
+			slog.String("delivery_id", delivery.ID.String()),
+			slog.String("event_id", delivery.EventID),
+		)
+		return d.failPermanent(ctx, delivery, attempt, nil, safeDestinationError(err))
+	}
+
 	secret, err := d.resolveSecret(ctx, delivery)
 	if err != nil {
-		return d.failPermanent(ctx, delivery, attempt, nil, err.Error())
+		// Do not persist repository/decryption diagnostics in a merchant-visible
+		// delivery record. The secret itself is never included, and the stable
+		// category is sufficient for operations to retry/repair configuration.
+		return d.failPermanent(ctx, delivery, attempt, nil, "webhook secret unavailable")
 	}
 
 	timestamp := strconv.FormatInt(time.Now().UTC().Unix(), 10)
@@ -122,7 +148,7 @@ func (d *merchantWebhookDispatcher) deliverOne(ctx context.Context, delivery *mo
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, delivery.EndpointURL, bytes.NewReader(delivery.Payload))
 	if err != nil {
-		return d.scheduleOrDead(ctx, delivery, attempt, nil, "build request: "+err.Error())
+		return d.scheduleOrDead(ctx, delivery, attempt, nil, "build request failed")
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", webhookUserAgent)
@@ -133,10 +159,26 @@ func (d *merchantWebhookDispatcher) deliverOne(ctx context.Context, delivery *mo
 
 	resp, err := d.httpClient.Do(req)
 	if err != nil {
-		return d.scheduleOrDead(ctx, delivery, attempt, nil, "http: "+err.Error())
+		// Connection-time destination enforcement fired: DNS changed or a
+		// rebinding answer appeared between validation and connection. The
+		// socket was never opened — permanent policy failure, no retry.
+		if errors.Is(err, ssrf.ErrDestinationBlocked) {
+			slog.Warn("merchant webhook destination blocked at connection time",
+				slog.String("delivery_id", delivery.ID.String()),
+				slog.String("event_id", delivery.EventID),
+			)
+			return d.failPermanent(ctx, delivery, attempt, nil, safeDestinationError(err))
+		}
+		// Non-policy transport errors stay retryable, but raw client errors may
+		// contain internal URLs or provider diagnostics. Persist only a stable
+		// category; the controlled error logger above records the delivery ID.
+		return d.scheduleOrDead(ctx, delivery, attempt, nil, "http delivery failed")
 	}
 	defer resp.Body.Close()
 
+	// Bounded (webhookMaxResponseBody) AND sanitised: only printable ASCII
+	// plus newline/tab survive, so a binary response can never persist
+	// garbage. Never logged in full — stored only as the retry diagnostic.
 	bodySnippet, _ := io.ReadAll(io.LimitReader(resp.Body, webhookMaxResponseBody))
 	status := resp.StatusCode
 
@@ -146,7 +188,7 @@ func (d *merchantWebhookDispatcher) deliverOne(ctx context.Context, delivery *mo
 
 	msg := fmt.Sprintf("http %d", status)
 	if len(bodySnippet) > 0 {
-		msg = fmt.Sprintf("http %d: %s", status, string(bodySnippet))
+		msg = fmt.Sprintf("http %d: %s", status, sanitizeWebhookSnippet(bodySnippet))
 	}
 
 	if isRetryableHTTPStatus(status) {
@@ -156,10 +198,41 @@ func (d *merchantWebhookDispatcher) deliverOne(ctx context.Context, delivery *mo
 	return d.failPermanent(ctx, delivery, attempt, &status, msg)
 }
 
+// safeDestinationError reduces an SSRF validation/connection error to its
+// STABLE safe message. The ssrf sentinels are deliberately free of addresses
+// and resolver detail; anything wrapped underneath is discarded so internal
+// network information can never enter last_error, API responses, or logs.
+func safeDestinationError(err error) string {
+	if errors.Is(err, ssrf.ErrDestinationBlocked) {
+		return ssrf.ErrDestinationBlocked.Error()
+	}
+	return ssrf.ErrInvalidURL.Error()
+}
+
+// sanitizeWebhookSnippet replaces non-printable bytes (everything outside
+// printable ASCII, newline, and tab) with '?' so the persisted response
+// snippet cannot contain binary garbage. The read itself is already bounded
+// by webhookMaxResponseBody, so the result stays within the 8 KiB cap.
+func sanitizeWebhookSnippet(b []byte) []byte {
+	out := make([]byte, 0, len(b))
+	for _, c := range b {
+		switch {
+		case c >= 0x20 && c <= 0x7e, c == '\n', c == '\t':
+			out = append(out, c)
+		default:
+			out = append(out, '?')
+		}
+	}
+	return out
+}
+
 func (d *merchantWebhookDispatcher) resolveSecret(ctx context.Context, delivery *model.MerchantWebhookDelivery) (string, error) {
 	cfg, err := d.configRepo.FindByMerchantID(ctx, delivery.MerchantID)
 	if err != nil {
 		return "", fmt.Errorf("load webhook config: %w", err)
+	}
+	if cfg.Status != model.MerchantWebhookConfigStatusActive {
+		return "", errors.New("webhook configuration is disabled")
 	}
 	return DecryptWebhookSecret(d.encKey, cfg.EncryptedSecret)
 }

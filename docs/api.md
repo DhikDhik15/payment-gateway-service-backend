@@ -32,6 +32,7 @@ These endpoints use `X-Admin-Key` from `ADMIN_API_KEY`; merchant API keys are no
 | GET | `/api/v1/admin/reconciliation/mismatches` | Paginated mismatch/unmatched results |
 | GET | `/api/v1/admin/reconciliation/mismatches/:id` | One audit result |
 | POST | `/api/v1/admin/merchants/:merchant_id/users` | Bootstrap a dashboard user (Phase 8) |
+| POST | `/api/v1/admin/onboarding/merchants` | Atomic tenant onboarding: merchant + OWNER + Phase 5C API key |
 
 ## Phase 8 Dashboard Auth
 
@@ -44,7 +45,55 @@ Dashboard login uses **email + password**, not merchant API keys. SPA contract: 
 | POST | `/api/v1/auth/refresh` | refresh cookie | Rotate session / new access token |
 | GET | `/api/v1/auth/me` | Bearer JWT | Current dashboard user |
 | GET | `/api/v1/dashboard/users` | Bearer JWT | List users in caller's merchant |
-| PATCH | `/api/v1/dashboard/users/:user_id/status` | Bearer JWT + OWNER | Enable/disable user |
+| PATCH | `/api/v1/dashboard/users/:user_id/status` | Bearer JWT + OWNER | Enable/disable user (last ACTIVE OWNER protected → `409 LAST_OWNER_REQUIRED`; disabling revokes all sessions) |
+| PATCH | `/api/v1/dashboard/users/:user_id/role` | Bearer JWT + OWNER | Change member role (Phase 8A; demoting the final ACTIVE OWNER → `409 LAST_OWNER_REQUIRED`; sessions unaffected — role is reloaded per request) |
+| PATCH | `/api/v1/dashboard/me/password` | Bearer JWT | Change own password (Phase 8A; `400 INVALID_CURRENT_PASSWORD` / `400 INVALID_PASSWORD`; all refresh sessions revoked on success) |
+| POST | `/api/v1/dashboard/legacy-credential/migrate` | Bearer JWT + OWNER/ADMIN | Phase 8D.3: atomic `LEGACY → MIGRATED`; returns the new Phase 5C secret **once** (`409 LEGACY_CREDENTIAL_ALREADY_MIGRATED` on repeat; VIEWER → `403`) |
+| POST | `/api/v1/dashboard/legacy-credential/disable` | Bearer JWT + OWNER/ADMIN | Phase 8D.3: atomic `MIGRATED → LEGACY_DISABLED`; idempotent (`already_disabled: true` on repeat; still-`LEGACY` → `409 LEGACY_CREDENTIAL_MIGRATION_REQUIRED`) |
+
+Phase 8A team mutations are blocked for non-ACTIVE merchants by
+`RequireDashboardAuth` (`401 MERCHANT_INACTIVE`). Cross-tenant target users
+return `404 DASHBOARD_USER_NOT_FOUND` so other tenants are never confirmed.
+
+Both legacy-credential endpoints take the merchant **only from the JWT** — no
+`merchant_id` is accepted from the path, query or body. See
+[legacy-credentials.md](./legacy-credentials.md).
+
+## Phase 8B Team Invitations
+
+Invitations are token-based and API-first. The plaintext token is returned
+**once** in the create response; only its SHA-256 hash is stored. Token
+validity: `INVITATION_TOKEN_TTL` (default `48h`).
+
+**Email delivery (Phases 8C.3A + 8C.3B):** creating an invitation also **queues** the
+invitation email (text + HTML, multipart) for asynchronous delivery: the
+invitation row and its `email_outbox` job are committed **atomically in one
+transaction** — the invitation exists ⇔ its queued email exists, and if either
+INSERT fails both roll back. The acceptance link is
+`{DASHBOARD_BASE_URL}/accept-invitation?token={TOKEN}` (token query-encoded
+via the standard URL API) and carries the **same** one-time token returned in
+the response. **SMTP is not part of the request critical path**: a background
+outbox worker claims the queued row and performs the actual send outside this
+request (retry with exponential backoff + jitter, permanent failures and
+exhausted attempts dead-lettered), so delivery can never affect the `201`
+response or the invitation's validity. Delivery is **at-least-once** — a
+crash between SMTP acceptance and the database update can produce a duplicate
+email. Internal outbox state is never exposed via the API. With
+`EMAIL_ENABLED=false` the worker still drains queued rows through the no-op
+sender (accepted, then discarded); invitation creation itself is identical
+either way.
+
+| Method | Path | Auth | Purpose |
+|---|---|---|---|
+| POST | `/api/v1/dashboard/users/invite` | Bearer JWT + OWNER | Create invitation (`{ "email", "role": "OWNER\|ADMIN\|VIEWER" }`); returns `201` with `token` (one-time) and queues the invitation email for asynchronous delivery (committed atomically with the invitation). `403 INSUFFICIENT_ROLE` for ADMIN/VIEWER (Phase 8A policy: team mutations are OWNER-only), `409 EMAIL_ALREADY_EXISTS`, `409 INVITATION_ALREADY_PENDING` (one active invitation per merchant+email — stale expired ones are replaced) |
+| GET | `/api/v1/invitations/:token` | — (token) | Preview invitation metadata (email, role, merchant name, expiry); unknown/expired/accepted/revoked tokens all return `404 INVITATION_NOT_FOUND` |
+| POST | `/api/v1/invitations/:token/accept` | — (token) | Accept invitation with `{ "password" }` (`8–128` chars, stored as Argon2id); atomically claims the single-use token and creates the ACTIVE user. `409 INVITATION_ALREADY_ACCEPTED` on replay, `403 MERCHANT_INACTIVE` if the merchant is no longer ACTIVE |
+
+Invitation creation requires an ACTIVE merchant (also enforced by
+`RequireDashboardAuth`). Acceptance re-checks merchant status server-side,
+so an invitation created before a suspension cannot be accepted while the
+merchant is suspended or inactive. The invited role is always explicit —
+never defaulted.
 
 ---
 
@@ -62,14 +111,29 @@ Created via `POST /api/v1/merchants/{id}/api-keys`. The plaintext
 `secret` is returned **only** on create/rotate. See
 [api-key-lifecycle.md](./api-key-lifecycle.md).
 
-### Legacy Phase 1 credentials (still supported)
+### Legacy Phase 1 credentials (migration window — Phase 8D.3)
 
 ```
 X-API-Key: pk_<hex>
 ```
 
-Obtained when creating a merchant via `POST /api/v1/merchants`. Bare legacy
-keys (no `:sk_` segment) continue to work; they are not invalidated by Phase 5C.
+Bare legacy keys (no `:sk_` segment) still work, but they are now **gated
+twice** and their creation is **frozen**:
+
+1. **`LEGACY_API_CREDENTIALS_ENABLED`** must be `true`. When it is `false`
+   (the **fail-safe default in production** when unset), every bare key is
+   rejected with `401 LEGACY_CREDENTIALS_NOT_ENABLED` **before any credential
+   lookup**, so the response never confirms existence.
+2. The merchant's **`legacy_credential_state`** must allow it: `LEGACY` and
+   `MIGRATED` authenticate, `LEGACY_DISABLED` — and any unknown value — fail
+   closed as a plain `401 INVALID_API_KEY`, checked *before* the `ACTIVE` check
+   so a disabled key cannot be probed through `MERCHANT_INACTIVE`.
+
+New legacy credentials can no longer be created at all: `POST /api/v1/merchants`
+always returns `409 LEGACY_CREDENTIAL_CREATION_DISABLED`.
+
+**Full design, state machine and runbook:**
+[legacy-credentials.md](./legacy-credentials.md).
 
 ---
 
@@ -88,26 +152,57 @@ Liveness check — always returns 200 when the server is running.
 
 ### GET /health/ready
 
-Readiness check — verifies PostgreSQL connectivity.
+Readiness check — verifies PostgreSQL connectivity and a clean supported schema
+migration state.
 
-**Response 200** — database reachable
+**Response 200** — database reachable and schema ready
 ```json
 { "success": true, "data": { "status": "ok" }, "meta": { "request_id": "req_xxx" } }
 ```
 
-**Response 503** — database unreachable
+**Response 503** — database unreachable or schema not ready
 ```json
-{ "success": false, "error": { "code": "DATABASE_UNAVAILABLE", "message": "Database is not reachable" }, "meta": { "request_id": "req_xxx" } }
+{ "success": false, "error": { "code": "DATABASE_UNAVAILABLE", "message": "Database is not ready" }, "meta": { "request_id": "req_xxx" } }
 ```
 
 ---
 
 ## Merchants
 
+### POST /api/v1/admin/onboarding/merchants
+
+**Preferred** secure tenant onboarding. Requires `X-Admin-Key`. Atomically creates
+merchant + OWNER dashboard user + initial Phase 5C API credential.
+
+See [phase-6-secure-tenant-onboarding.md](./phase-6-secure-tenant-onboarding.md).
+
+**curl example**
+```bash
+curl -s -X POST http://localhost:8080/api/v1/admin/onboarding/merchants \
+  -H "Content-Type: application/json" \
+  -H "X-Admin-Key: $ADMIN_API_KEY" \
+  -d '{"name":"Demo Merchant","code":"DEMO001","owner_email":"owner@demo.example","owner_password":"securepass1"}'
+```
+
+---
+
 ### POST /api/v1/merchants
 
-Register a new merchant. Returns an API key for subsequent calls.
-The API secret is **not** returned after this call and is never stored in plain text.
+> **FROZEN (Phase 8D.3) — always returns `409 LEGACY_CREDENTIAL_CREATION_DISABLED`.**
+>
+> Creation of new row-level legacy plaintext credentials is permanently
+> disabled. The endpoint is retained only so existing clients receive a stable,
+> documented error instead of a `404`; the service returns the freeze error as
+> its **first** statement, before the duplicate-code check and before any
+> database access. Requires `X-Admin-Key`.
+>
+> - Provision new tenants with
+>   [`POST /api/v1/admin/onboarding/merchants`](#post-apiv1adminonboardingmerchants)
+>   (atomic merchant + OWNER + Phase 5C credential, merchant stored as
+>   `MIGRATED` with `api_key = NULL`).
+> - Existing tenants migrate with
+>   `POST /api/v1/dashboard/legacy-credential/migrate`.
+> - Design and runbook: [legacy-credentials.md](./legacy-credentials.md).
 
 **Request**
 ```json
@@ -122,17 +217,13 @@ The API secret is **not** returned after this call and is never stored in plain 
 | name  | string | required, 2–150 chars |
 | code  | string | required, 2–50 chars, unique |
 
-**Response 201**
+**Response 409** — creation is frozen (the only non-validation/non-auth outcome)
 ```json
 {
-  "success": true,
-  "data": {
-    "id": "14a49e45-bb31-4abe-98b3-ee38ff002268",
-    "name": "Demo Merchant",
-    "code": "DEMO001",
-    "api_key": "pk_f139fbe7...",
-    "status": "ACTIVE",
-    "created_at": "2026-09-11T02:56:24Z"
+  "success": false,
+  "error": {
+    "code": "LEGACY_CREDENTIAL_CREATION_DISABLED",
+    "message": "Legacy credential creation is disabled; use POST /api/v1/admin/onboarding/merchants"
   },
   "meta": { "request_id": "req_xxx" }
 }
@@ -151,19 +242,16 @@ The API secret is **not** returned after this call and is never stored in plain 
 }
 ```
 
-**Response 409** — duplicate code
-```json
-{
-  "success": false,
-  "error": { "code": "DUPLICATE_MERCHANT_CODE", "message": "Merchant code already exists" },
-  "meta": { "request_id": "req_xxx" }
-}
-```
+**Response 401** — missing/invalid admin key
+
+> `409 DUPLICATE_MERCHANT_CODE` is no longer reachable: an existing code now
+> yields the freeze error, because the freeze is evaluated first.
 
 **curl example**
 ```bash
 curl -s -X POST http://localhost:8080/api/v1/merchants \
   -H "Content-Type: application/json" \
+  -H "X-Admin-Key: $ADMIN_API_KEY" \
   -d '{"name":"Demo Merchant","code":"DEMO001"}'
 ```
 
@@ -172,6 +260,9 @@ curl -s -X POST http://localhost:8080/api/v1/merchants \
 ### GET /api/v1/merchants/:id
 
 Retrieve merchant details. Does **not** return `api_key` or `api_secret`.
+`legacy_credential_state` **is** returned — it is a migration-state label, not
+a credential — so clients can prompt for migration.
+> This endpoint requires `X-Admin-Key` in the assembled server.
 
 **Response 200**
 ```json
@@ -183,11 +274,15 @@ Retrieve merchant details. Does **not** return `api_key` or `api_secret`.
     "code": "DEMO001",
     "status": "ACTIVE",
     "created_at": "2026-09-11T02:56:24Z",
-    "updated_at": "2026-09-11T02:56:24Z"
+    "updated_at": "2026-09-11T02:56:24Z",
+    "legacy_credential_state": "LEGACY"
   },
   "meta": { "request_id": "req_xxx" }
 }
 ```
+
+> `legacy_credential_state` is one of `LEGACY`, `MIGRATED`, `LEGACY_DISABLED`;
+> `legacy_credential_disabled_at` appears (once set) alongside it.
 
 **Response 404**
 ```json
@@ -816,14 +911,18 @@ curl -s -H "X-API-Key: pk_f139fbe7..." \
 | INVALID_CURRENCY | 400 | Unsupported currency (only IDR in Phase 2) |
 | INVALID_PAYMENT_METHOD | 400 | Unsupported payment method (only QRIS in Phase 2) |
 | UNAUTHORIZED | 401 | Generic authentication failure |
-| INVALID_API_KEY | 401 | Missing or invalid X-API-Key header |
+| INVALID_API_KEY | 401 | Missing or invalid X-API-Key header — also returned for a `LEGACY_DISABLED` or unknown-state legacy key (deliberately indistinguishable from an unknown key) |
+| LEGACY_CREDENTIALS_NOT_ENABLED | 401 | `LEGACY_API_CREDENTIALS_ENABLED=false`; bare legacy key rejected **before any credential lookup** |
 | MERCHANT_INACTIVE | 401 | Merchant account is not ACTIVE |
-| FORBIDDEN | 403 | Authenticated but not authorised |
+| FORBIDDEN | 403 | Authenticated but not authorised (e.g. `INSUFFICIENT_ROLE` for a VIEWER on the legacy-credential endpoints) |
 | MERCHANT_NOT_FOUND | 404 | No merchant with given ID |
 | TRANSACTION_NOT_FOUND | 404 | No transaction, or belongs to another merchant |
 | REFUND_NOT_FOUND | 404 | No refund with given ID, or belongs to another merchant |
 | DUPLICATE_ORDER | 409 | merchant_order_id already exists for this merchant |
-| DUPLICATE_MERCHANT_CODE | 409 | Merchant code already registered |
+| DUPLICATE_MERCHANT_CODE | 409 | Merchant code already registered (**unreachable since Phase 8D.3** — the frozen create endpoint returns `LEGACY_CREDENTIAL_CREATION_DISABLED` first) |
+| LEGACY_CREDENTIAL_CREATION_DISABLED | 409 | Phase 8D.3: creation of new legacy plaintext credentials is permanently frozen (`POST /api/v1/merchants`) |
+| LEGACY_CREDENTIAL_ALREADY_MIGRATED | 409 | Phase 8D.3: migrate attempted outside state `LEGACY` (also returned to the losing side of a concurrent migrate) |
+| LEGACY_CREDENTIAL_MIGRATION_REQUIRED | 409 | Phase 8D.3: disable attempted while still `LEGACY` — migrate first so no tenant is left without a working credential |
 | INVALID_TRANSACTION_STATE | 409 | State transition not allowed |
 | IDEMPOTENCY_KEY_REUSED | 409 | Same Idempotency-Key submitted with a different request payload |
 | IDEMPOTENCY_REQUEST_IN_PROGRESS | 409 | A request with this Idempotency-Key is still being processed |

@@ -304,6 +304,9 @@ type memMerchantRepoForWebhook struct {
 }
 
 func (r *memMerchantRepoForWebhook) Create(_ context.Context, _ *model.Merchant) error { return nil }
+func (r *memMerchantRepoForWebhook) CreateInTx(_ context.Context, _ pgx.Tx, _ *model.Merchant) error {
+	return nil
+}
 func (r *memMerchantRepoForWebhook) GetByID(_ context.Context, id uuid.UUID) (*model.Merchant, error) {
 	if r.m == nil || r.m.ID != id {
 		return nil, repository.ErrMerchantNotFound
@@ -317,6 +320,14 @@ func (r *memMerchantRepoForWebhook) ExistsByCode(_ context.Context, _ string) (b
 	return false, nil
 }
 
+func (r *memMerchantRepoForWebhook) UpdateStatus(_ context.Context, id uuid.UUID, status model.MerchantStatus) error {
+	if r.m != nil && r.m.ID == id {
+		r.m.Status = status
+		return nil
+	}
+	return repository.ErrMerchantNotFound
+}
+
 func TestMerchantWebhookConfigService_Lifecycle(t *testing.T) {
 	mid := uuid.New()
 	merchantRepo := &memMerchantRepoForWebhook{m: &model.Merchant{ID: mid, Status: model.MerchantStatusActive}}
@@ -325,7 +336,7 @@ func TestMerchantWebhookConfigService_Lifecycle(t *testing.T) {
 	svc := service.NewMerchantWebhookConfigService(cfgRepo, delRepo, merchantRepo, testEncKey(), false)
 
 	created, err := svc.Upsert(context.Background(), mid, model.UpsertMerchantWebhookRequest{
-		URL: "http://localhost:9999/hook",
+		URL: "https://hooks.example.com/hook",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -435,12 +446,13 @@ func TestMerchantWebhookDispatcher_SuccessAndStableEventID(t *testing.T) {
 	delivery := &model.MerchantWebhookDelivery{
 		ID: uuid.New(), MerchantID: mid, EventID: eventID,
 		EventType: model.MerchantWebhookEventPaymentPaid, TransactionID: uuid.New(),
-		EndpointURL: srv.URL, Payload: payload, Status: model.MerchantWebhookDeliveryStatusPending,
+		EndpointURL: publicWebhookTestEndpoint, Payload: payload, Status: model.MerchantWebhookDeliveryStatusPending,
 		NextAttemptAt: time.Now().UTC().Add(-time.Second), CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
 	}
 	_ = delRepo.Create(context.Background(), delivery)
 
-	dispatcher := service.NewMerchantWebhookDispatcher(delRepo, cfgRepo, testEncKey(), 2*time.Second, 8, time.Minute, 10)
+	dispatcher := service.NewMerchantWebhookDispatcher(delRepo, cfgRepo, testEncKey(), 2*time.Second, 8, time.Minute, 10,
+		publicWebhookTestClient(2*time.Second, srv.Listener.Addr().String()))
 	n, err := dispatcher.ProcessBatch(context.Background())
 	if err != nil || n != 1 {
 		t.Fatalf("n=%d err=%v", n, err)
@@ -475,12 +487,13 @@ func TestMerchantWebhookDispatcher_Retryable5xx(t *testing.T) {
 	d := &model.MerchantWebhookDelivery{
 		ID: uuid.New(), MerchantID: mid, EventID: "evt_retry",
 		EventType: model.MerchantWebhookEventPaymentFailed, TransactionID: uuid.New(),
-		EndpointURL: srv.URL, Payload: []byte(`{"id":"evt_retry"}`),
+		EndpointURL: publicWebhookTestEndpoint, Payload: []byte(`{"id":"evt_retry"}`),
 		Status: model.MerchantWebhookDeliveryStatusPending, NextAttemptAt: time.Now().UTC().Add(-time.Second),
 		CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
 	}
 	_ = delRepo.Create(context.Background(), d)
-	dispatcher := service.NewMerchantWebhookDispatcher(delRepo, cfgRepo, testEncKey(), time.Second, 8, time.Minute, 10)
+	dispatcher := service.NewMerchantWebhookDispatcher(delRepo, cfgRepo, testEncKey(), time.Second, 8, time.Minute, 10,
+		publicWebhookTestClient(time.Second, srv.Listener.Addr().String()))
 	_, _ = dispatcher.ProcessBatch(context.Background())
 	got, _ := delRepo.FindByID(context.Background(), mid, d.ID)
 	if got.Status != model.MerchantWebhookDeliveryStatusPending {
@@ -509,12 +522,13 @@ func TestMerchantWebhookDispatcher_NonRetryable4xx(t *testing.T) {
 	d := &model.MerchantWebhookDelivery{
 		ID: uuid.New(), MerchantID: mid, EventID: "evt_fail",
 		EventType: model.MerchantWebhookEventPaymentPaid, TransactionID: uuid.New(),
-		EndpointURL: srv.URL, Payload: []byte(`{"id":"evt_fail"}`),
+		EndpointURL: publicWebhookTestEndpoint, Payload: []byte(`{"id":"evt_fail"}`),
 		Status: model.MerchantWebhookDeliveryStatusPending, NextAttemptAt: time.Now().UTC().Add(-time.Second),
 		CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
 	}
 	_ = delRepo.Create(context.Background(), d)
-	dispatcher := service.NewMerchantWebhookDispatcher(delRepo, cfgRepo, testEncKey(), time.Second, 8, time.Minute, 10)
+	dispatcher := service.NewMerchantWebhookDispatcher(delRepo, cfgRepo, testEncKey(), time.Second, 8, time.Minute, 10,
+		publicWebhookTestClient(time.Second, srv.Listener.Addr().String()))
 	_, _ = dispatcher.ProcessBatch(context.Background())
 	got, _ := delRepo.FindByID(context.Background(), mid, d.ID)
 	if got.Status != model.MerchantWebhookDeliveryStatusFailed {

@@ -1,34 +1,125 @@
 services:
 
   # ── Application ─────────────────────────────────────────────────────────────
+  # PostgreSQL is intentionally external to this development Compose file.
+  # Production/staging must use a private, certificate-verified database.
   app:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: pay-gate-app
     restart: unless-stopped
+    init: true
+    stop_grace_period: 20s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
     ports:
-      - "8081:8080"
+      - "127.0.0.1:8081:8080"
     environment:
       APP_NAME: payment-gateway
-      APP_ENV: development
+      # Phase 8D.1: APP_ENV is overridable from the host .env and defaults to
+      # development; production rejects PAYMENT_SIMULATOR_ENABLED=true at startup.
+      APP_ENV: ${APP_ENV:-development}
+      # The container listens on 8080; Docker publishes that port as host 8081.
+      # Keep the internal listen port aligned with the ports mapping above.
       APP_PORT: "8080"
+      # Browser-facing origin for generated mock PaymentURLs. The container's
+      # localhost:8080 is not reachable from the host, so the development
+      # Compose default points at the Vite frontend origin instead.
+      FRONTEND_PUBLIC_URL: ${FRONTEND_PUBLIC_URL:-http://localhost:5173}
+      PAYMENT_PROVIDER: ${PAYMENT_PROVIDER:-mock}
+      PAYMENT_PROVIDER_TIMEOUT: ${PAYMENT_PROVIDER_TIMEOUT:-15s}
+      # Development/staging default; production must set the explicit provider
+      # endpoint and config.Load rejects the sandbox fallback.
+      MIDTRANS_BASE_URL: ${MIDTRANS_BASE_URL:-https://app.sandbox.midtrans.com}
+      MIDTRANS_SERVER_KEY: ${MIDTRANS_SERVER_KEY:-}
+      MIDTRANS_CLIENT_KEY: ${MIDTRANS_CLIENT_KEY:-}
+      IDEMPOTENCY_TTL: ${IDEMPOTENCY_TTL:-24h}
+      PAYMENT_EXPIRY_ENABLED: ${PAYMENT_EXPIRY_ENABLED:-true}
+      PAYMENT_EXPIRY_INTERVAL: ${PAYMENT_EXPIRY_INTERVAL:-30s}
+      PAYMENT_EXPIRY_BATCH_SIZE: ${PAYMENT_EXPIRY_BATCH_SIZE:-100}
+      # Phase 8D.1: simulator defaults to FALSE (fail closed). Set to true only
+      # for local development; APP_ENV=production + true fails config.Load.
+      PAYMENT_SIMULATOR_ENABLED: ${PAYMENT_SIMULATOR_ENABLED:-false}
+      # Required when PAYMENT_SIMULATOR_ENABLED=true (app fails fast if missing/invalid).
+      SIMULATOR_MERCHANT_ID: ${SIMULATOR_MERCHANT_ID:-}
+      # Phase 8D.3: legacy plaintext credential migration window. Empty/unset
+      # lets config.Load decide the environment default (true in
+      # development/test, FALSE in production — fail safe). Only "true" opens
+      # the window; a non-boolean value fails startup.
+      LEGACY_API_CREDENTIALS_ENABLED: ${LEGACY_API_CREDENTIALS_ENABLED:-}
+      # Phase 8D.1: in-process rate limiting (defaults enabled 10/60/120 per minute).
+      RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED:-true}
+      RATE_LIMIT_LOGIN_PER_MINUTE: ${RATE_LIMIT_LOGIN_PER_MINUTE:-10}
+      RATE_LIMIT_ADMIN_PER_MINUTE: ${RATE_LIMIT_ADMIN_PER_MINUTE:-60}
+      RATE_LIMIT_API_PER_MINUTE: ${RATE_LIMIT_API_PER_MINUTE:-120}
+      # Phase 8D.2: inbound HTTP hardening (defaults shown; all validated
+      # fail-fast at startup — zero/negative values are rejected).
+      HTTP_MAX_BODY_BYTES: ${HTTP_MAX_BODY_BYTES:-1048576}
+      HTTP_READ_HEADER_TIMEOUT: ${HTTP_READ_HEADER_TIMEOUT:-10s}
+      HTTP_READ_TIMEOUT: ${HTTP_READ_TIMEOUT:-15s}
+      HTTP_WRITE_TIMEOUT: ${HTTP_WRITE_TIMEOUT:-15s}
+      HTTP_IDLE_TIMEOUT: ${HTTP_IDLE_TIMEOUT:-60s}
+      # Phase 8D.2: X-Forwarded-For trust. Set "none" or an explicit IP/CIDR list
+      # in production; config.Load rejects an unset production value.
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
       DB_HOST: ${DB_HOST:-host.docker.internal}
       DB_PORT: ${DB_PORT:-5432}
       DB_USER: ${DB_USER:?DB_USER is required}
       DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
       DB_NAME: ${DB_NAME:-payment_gateway}
+      # Development defaults to disable; production config requires verify-full.
       DB_SSLMODE: ${DB_SSLMODE:-disable}
-      WEBHOOK_DELIVERY_ENABLED: "true"
-      WEBHOOK_REQUIRE_HTTPS: "false"
+      WEBHOOK_DELIVERY_ENABLED: ${WEBHOOK_DELIVERY_ENABLED:-true}
+      WEBHOOK_DELIVERY_INTERVAL: ${WEBHOOK_DELIVERY_INTERVAL:-5s}
+      WEBHOOK_DELIVERY_BATCH_SIZE: ${WEBHOOK_DELIVERY_BATCH_SIZE:-20}
+      WEBHOOK_DELIVERY_TIMEOUT: ${WEBHOOK_DELIVERY_TIMEOUT:-10s}
+      WEBHOOK_MAX_ATTEMPTS: ${WEBHOOK_MAX_ATTEMPTS:-8}
+      WEBHOOK_DELIVERY_STALE_AFTER: ${WEBHOOK_DELIVERY_STALE_AFTER:-2m}
+      # Empty lets config.Load choose false in development and true in production.
+      WEBHOOK_REQUIRE_HTTPS: ${WEBHOOK_REQUIRE_HTTPS:-}
       ADMIN_API_KEY: ${ADMIN_API_KEY:-}
+      MOCK_WEBHOOK_SECRET: ${MOCK_WEBHOOK_SECRET:-}
       SETTLEMENT_RECON_STALE_AFTER: ${SETTLEMENT_RECON_STALE_AFTER:-2m}
-      WEBHOOK_SECRET_ENCRYPTION_KEY: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      # Passed through from the host .env. When empty/unset the app uses the
+      # development-only fallback key (same bytes as the old hardcoded value,
+      # so existing local encrypted webhook secrets still decrypt). NEVER
+      # leave this empty in production — config.Load requires it there.
+      WEBHOOK_SECRET_ENCRYPTION_KEY: ${WEBHOOK_SECRET_ENCRYPTION_KEY:-}
       # Phase 8 — dashboard auth (never commit real secrets; pass via host .env)
       AUTH_JWT_SECRET: ${AUTH_JWT_SECRET:-}
       AUTH_ACCESS_TOKEN_TTL: ${AUTH_ACCESS_TOKEN_TTL:-15m}
       AUTH_REFRESH_TOKEN_TTL: ${AUTH_REFRESH_TOKEN_TTL:-168h}
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:5173}
+      # Phase 8B/8C — team invitations + email delivery
+      INVITATION_TOKEN_TTL: ${INVITATION_TOKEN_TTL:-48h}
+      DASHBOARD_BASE_URL: ${DASHBOARD_BASE_URL:-http://localhost:5173}
+      EMAIL_ENABLED: ${EMAIL_ENABLED:-false}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      SMTP_TLS: ${SMTP_TLS:-starttls}
+      SMTP_TIMEOUT: ${SMTP_TIMEOUT:-10s}
+      # Phase 8C.3B — email outbox worker (other EMAIL_WORKER_* knobs default in config)
+      EMAIL_WORKER_ENABLED: ${EMAIL_WORKER_ENABLED:-true}
+      EMAIL_WORKER_INTERVAL: ${EMAIL_WORKER_INTERVAL:-5s}
+      EMAIL_WORKER_BATCH_SIZE: ${EMAIL_WORKER_BATCH_SIZE:-20}
+      EMAIL_WORKER_MAX_ATTEMPTS: ${EMAIL_WORKER_MAX_ATTEMPTS:-8}
+      EMAIL_WORKER_STALE_AFTER: ${EMAIL_WORKER_STALE_AFTER:-2m}
+      # Phase 8C.3C — terminal retention cleanup (opt-in; safe defaults = approved
+      # policy 7d/30d). All five are passed so .env overrides reach the container.
+      EMAIL_CLEANUP_ENABLED: ${EMAIL_CLEANUP_ENABLED:-false}
+      EMAIL_CLEANUP_INTERVAL: ${EMAIL_CLEANUP_INTERVAL:-1h}
+      EMAIL_CLEANUP_BATCH_SIZE: ${EMAIL_CLEANUP_BATCH_SIZE:-100}
+      EMAIL_OUTBOX_SENT_RETENTION: ${EMAIL_OUTBOX_SENT_RETENTION:-168h}
+      EMAIL_OUTBOX_DEAD_RETENTION: ${EMAIL_OUTBOX_DEAD_RETENTION:-720h}
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -41,12 +132,29 @@ services:
   migrate:
     image: migrate/migrate:v4.18.1
     container_name: pay-gate-migrate
+    restart: "no"
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
     volumes:
-      - ./migrations:/migrations
+      - ./migrations:/migrations:ro
+    environment:
+      # Production/staging should inject a complete URL (with credentials
+      # URL-encoded) so special characters in a password are not interpolated
+      # into the fallback development connection string below.
+      MIGRATION_DATABASE_URL: ${MIGRATION_DATABASE_URL:-}
+    entrypoint: ["/bin/sh", "-c"]
     command:
-      - "-path=/migrations"
-      - "-database=postgres://${DB_USER}:${DB_PASSWORD}@${DB_HOST:-host.docker.internal}:${DB_PORT:-5432}/${DB_NAME:-payment_gateway}?sslmode=${DB_SSLMODE:-disable}"
-      - "up"
+      - |
+        if [ -n "$$MIGRATION_DATABASE_URL" ]; then
+          exec /usr/local/bin/migrate -path=/migrations -database "$$MIGRATION_DATABASE_URL" up
+        fi
+        exec /usr/local/bin/migrate -path=/migrations -database "postgres://${DB_USER}:${DB_PASSWORD}@${DB_HOST:-host.docker.internal}:${DB_PORT:-5432}/${DB_NAME:-payment_gateway}?sslmode=${DB_SSLMODE:-disable}" up
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:

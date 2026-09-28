@@ -52,6 +52,7 @@ type stubPaymentService struct {
 	createResp   *model.CreatePaymentResponse
 	createErr    error
 	lastMerchant uuid.UUID
+	lastFilter   model.TransactionListFilter
 	lastTxID     uuid.UUID
 	createCalled bool
 }
@@ -80,18 +81,26 @@ func (s *stubPaymentService) GetPayment(_ context.Context, merchantID, txID uuid
 }
 func (s *stubPaymentService) ListPayments(_ context.Context, merchantID uuid.UUID, filter model.TransactionListFilter) (*model.ListPaymentsResult, error) {
 	s.lastMerchant = merchantID
+	s.lastFilter = filter
 	if s.listErr != nil {
 		return nil, s.listErr
 	}
 	if s.listResult != nil {
 		return s.listResult, nil
 	}
+	page, limit := filter.Page, filter.Limit
+	if page == 0 {
+		page = model.DefaultPage
+	}
+	if limit == 0 {
+		limit = model.DefaultLimit
+	}
 	return &model.ListPaymentsResult{
 		Transactions: []model.PaymentResponse{},
 		Total:        0,
 		TotalPages:   0,
-		Page:         filter.Page,
-		Limit:        filter.Limit,
+		Page:         page,
+		Limit:        limit,
 	}, nil
 }
 
@@ -189,6 +198,10 @@ func (s *stubMerchantService) GetMerchantByAPIKey(context.Context, string) (*mod
 	return nil, nil
 }
 
+func (s *stubMerchantService) UpdateMerchantStatus(_ context.Context, _ uuid.UUID, _ model.MerchantStatus) (*model.GetMerchantResponse, error) {
+	return s.resp, nil
+}
+
 type stubReconService struct {
 	listResult *service.ListReconResultsResult
 	getResult  *model.ReconciliationResult
@@ -275,7 +288,7 @@ func newDashPhase9Router(role model.DashboardUserRole) *dashPhase9Deps {
 	reconH := handler.NewDashboardReconciliationHandler(reconSvc)
 
 	dash := r.Group("/api/v1/dashboard")
-	dash.Use(middleware.RequireDashboardAuth(authSvc, userRepo))
+	dash.Use(middleware.RequireDashboardAuth(authSvc, userRepo, newActiveMerchantRepo(merchantID)))
 	{
 		dash.GET("/overview", overviewH.GetOverview)
 		dash.GET("/payments", paymentH.ListPayments)
@@ -380,6 +393,127 @@ func TestDashboardPhase9_PaymentsList_MerchantScoped(t *testing.T) {
 	}
 	if deps.paymentSvc.lastMerchant != deps.user.MerchantID {
 		t.Fatalf("list used wrong merchant")
+	}
+}
+
+// TestDashboardPhase9_PaymentsList_EnvelopeWithPayment locks the contract the
+// dashboard SPA reads: success + data[] + flat meta.page/limit/total/total_pages.
+func TestDashboardPhase9_PaymentsList_EnvelopeWithPayment(t *testing.T) {
+	deps := newDashPhase9Router(model.DashboardUserRoleOwner)
+	txID := uuid.New()
+	deps.paymentSvc.listResult = &model.ListPaymentsResult{
+		Transactions: []model.PaymentResponse{{
+			TransactionID:   txID,
+			MerchantOrderID: "ORDER-001",
+			Amount:          50000,
+			Currency:        "IDR",
+			Status:          model.TransactionStatusPending,
+			CreatedAt:       time.Now().UTC(),
+			UpdatedAt:       time.Now().UTC(),
+		}},
+		Total: 1, TotalPages: 1, Page: 1, Limit: 10,
+	}
+
+	w := dashDo(deps.router, http.MethodGet, "/api/v1/dashboard/payments?page=1&limit=10", nil, "token")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+
+	var env struct {
+		Success bool `json:"success"`
+		Data    []struct {
+			TransactionID   string `json:"transaction_id"`
+			MerchantOrderID string `json:"merchant_order_id"`
+			Amount          int64  `json:"amount"`
+			Currency        string `json:"currency"`
+			Status          string `json:"status"`
+		} `json:"data"`
+		Meta map[string]any `json:"meta"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !env.Success {
+		t.Fatal("expected success=true")
+	}
+	if len(env.Data) != 1 {
+		t.Fatalf("expected data.length==1, got %d", len(env.Data))
+	}
+	if env.Data[0].TransactionID != txID.String() || env.Data[0].MerchantOrderID != "ORDER-001" {
+		t.Fatalf("unexpected payment row: %+v", env.Data[0])
+	}
+	if _, ok := env.Meta["pagination"]; ok {
+		t.Fatal("API contract uses flat meta.total_pages, not meta.pagination")
+	}
+	for _, key := range []string{"page", "limit", "total", "total_pages"} {
+		if _, ok := env.Meta[key]; !ok {
+			t.Fatalf("meta missing %q: %+v", key, env.Meta)
+		}
+	}
+	if int(env.Meta["total"].(float64)) != 1 || int(env.Meta["total_pages"].(float64)) != 1 {
+		t.Fatalf("unexpected pagination meta: %+v", env.Meta)
+	}
+	if deps.paymentSvc.lastFilter.Page != 1 || deps.paymentSvc.lastFilter.Limit != 10 {
+		t.Fatalf("filter page/limit: got page=%d limit=%d", deps.paymentSvc.lastFilter.Page, deps.paymentSvc.lastFilter.Limit)
+	}
+}
+
+func TestDashboardPhase9_PaymentsList_EmptyMerchant(t *testing.T) {
+	deps := newDashPhase9Router(model.DashboardUserRoleViewer)
+	deps.paymentSvc.listResult = &model.ListPaymentsResult{
+		Transactions: []model.PaymentResponse{},
+		Total:        0, TotalPages: 0, Page: 1, Limit: 10,
+	}
+
+	w := dashDo(deps.router, http.MethodGet, "/api/v1/dashboard/payments?page=1&limit=10", nil, "token")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var env struct {
+		Success bool            `json:"success"`
+		Data    json.RawMessage `json:"data"`
+		Meta    map[string]any  `json:"meta"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatal(err)
+	}
+	if !env.Success {
+		t.Fatal("expected success=true")
+	}
+	if string(env.Data) != "[]" {
+		t.Fatalf("expected data=[], got %s", env.Data)
+	}
+	if int(env.Meta["total"].(float64)) != 0 || int(env.Meta["total_pages"].(float64)) != 0 {
+		t.Fatalf("empty list meta: %+v", env.Meta)
+	}
+}
+
+func TestDashboardPhase9_PaymentsList_SearchAndStatusFilters(t *testing.T) {
+	deps := newDashPhase9Router(model.DashboardUserRoleAdmin)
+	deps.paymentSvc.listResult = &model.ListPaymentsResult{
+		Transactions: []model.PaymentResponse{},
+		Total:        0, TotalPages: 0, Page: 1, Limit: 10,
+	}
+
+	w := dashDo(deps.router, http.MethodGet,
+		"/api/v1/dashboard/payments?page=1&limit=10&status=PENDING&search=ORDER-001", nil, "token")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	f := deps.paymentSvc.lastFilter
+	if f.Status == nil || *f.Status != model.TransactionStatusPending {
+		t.Fatalf("expected status=PENDING, got %#v", f.Status)
+	}
+	if f.Search == nil || *f.Search != "ORDER-001" {
+		t.Fatalf("expected search=ORDER-001, got %#v", f.Search)
+	}
+}
+
+func TestDashboardPhase9_PaymentsList_RejectsLiteralAllStatus(t *testing.T) {
+	deps := newDashPhase9Router(model.DashboardUserRoleOwner)
+	w := dashDo(deps.router, http.MethodGet, "/api/v1/dashboard/payments?status=all", nil, "token")
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for status=all, got %d body=%s", w.Code, w.Body.String())
 	}
 }
 

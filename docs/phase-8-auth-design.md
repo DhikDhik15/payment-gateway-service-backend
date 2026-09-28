@@ -30,7 +30,7 @@ React dashboard UI
 | React SPA compatibility | JWTs are easy to use in Authorization headers |
 | XSS resistance for refresh token | HttpOnly cookie prevents JavaScript access |
 | Short exposure window | 15-minute access token limits blast radius of token theft |
-| Session revocation | Server-side session record allows true invalidation |
+| Session revocation | Server-side refresh-session record provides continuation revocation; access JWT validity remains bounded by TTL |
 | Zero external dependencies | HS256 JWT implemented with stdlib crypto only |
 
 ### Why not long-lived JWTs only?
@@ -58,14 +58,28 @@ Cookies-only requires careful CSRF protection. The Bearer token approach for API
 3. Access token expiry (after 15m)
    ├── POST /api/v1/auth/refresh (sends refresh_token cookie automatically)
    ├── Validates refresh token hash against dashboard_sessions
-   ├── Rotates session: deletes old → creates new session
+   ├── Atomically CAS-rotates the refresh hash on the same stable session row
    └── Issues: new access token + new refresh cookie
 
 4. Logout (POST /api/v1/auth/logout)
-   ├── Reads refresh token from HttpOnly cookie (or X-Refresh-Token header)
-   ├── Deletes matching dashboard_sessions row
+   ├── Reads a valid Bearer access token when available and uses its stable `sid` claim
+   ├── Deletes the exact dashboard session (scoped to the token subject)
+   ├── Falls back to the refresh-token hash for legacy/header-only clients
    └── Clears refresh_token cookie (MaxAge: -1)
-```
+
+### Logout and access-JWT contract (Phase 11.1)
+
+This project intentionally uses **bounded stateless access JWTs**:
+
+- Logout revokes the refresh session and prevents future refresh continuation.
+- The frontend clears its memory-only access token and authenticated query state.
+- A previously issued access JWT is **not** added to a blacklist. It remains usable until its `exp` claim (default maximum residual validity: `AUTH_ACCESS_TOKEN_TTL`, normally 15 minutes).
+- Logout therefore does **not** promise immediate revocation of a stolen/copyable access bearer token.
+- User and merchant lifecycle checks still reject outstanding access JWTs on the next protected request when the user is disabled or the merchant is INACTIVE/SUSPENDED.
+- The stable `sid` claim is not a secret; it lets logout remain session-row-safe if refresh rotation races with logout. A refresh that wins may return an access token, but the subsequent logout removes the same logical session row, so no new refresh can be obtained from it.
+- A request that authenticates before logout may complete; Model A does not provide cancellation of in-flight requests.
+
+This is a deliberate security trade-off: the HttpOnly refresh token limits continuation theft, while the short access-token lifetime bounds bearer-token exposure.
 
 ---
 
@@ -80,7 +94,8 @@ Signed with HMAC-SHA256 using `AUTH_JWT_SECRET`.
   "role": "OWNER",
   "iat": 1726123456,
   "exp": 1726124356,
-  "jti": "<unique_token_id>"
+  "jti": "<unique_token_id>",
+  "sid": "<stable_dashboard_session_id>"
 }
 ```
 
@@ -88,6 +103,7 @@ Signed with HMAC-SHA256 using `AUTH_JWT_SECRET`.
 - `mid` — merchant UUID (fast isolation without a DB lookup per request)
 - `role` — current role at token issue time
 - `jti` — prevents token reuse analysis attacks (unique per token)
+- `sid` — stable logical dashboard-session ID; not a secret and not an access credential by itself
 
 **Never include** password, password_hash, API keys, secrets, or provider credentials in JWT claims.
 
@@ -124,7 +140,7 @@ $argon2id$v=19$m=65536,t=1,p=4$<salt_base64>$<hash_base64>
 - Never stored in plaintext — only its **SHA-256 hex hash** is stored
 - Delivered to client **once** via `HttpOnly; Secure; SameSite=Strict` cookie
 - Cookie path is scoped to `/api/v1/auth` (not the entire site)
-- Token rotation: each `/auth/refresh` call revokes the old session and creates a new one
+- Token rotation: each `/auth/refresh` call atomically replaces the old hash on the same logical session row; the row ID and `sid` remain stable
 
 ---
 

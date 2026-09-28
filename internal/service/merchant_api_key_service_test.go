@@ -12,6 +12,7 @@ import (
 	"github.com/dhikaarta/pay-gate-backend/internal/repository"
 	"github.com/dhikaarta/pay-gate-backend/internal/service"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 )
 
 // ─── In-memory repos ──────────────────────────────────────────────────────────
@@ -31,6 +32,9 @@ func (r *memMerchantRepoAPIKey) Create(_ context.Context, m *model.Merchant) err
 	r.byID[m.ID] = m
 	return nil
 }
+func (r *memMerchantRepoAPIKey) CreateInTx(ctx context.Context, _ pgx.Tx, m *model.Merchant) error {
+	return r.Create(ctx, m)
+}
 func (r *memMerchantRepoAPIKey) GetByID(_ context.Context, id uuid.UUID) (*model.Merchant, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -46,6 +50,17 @@ func (r *memMerchantRepoAPIKey) GetByAPIKey(_ context.Context, _ string) (*model
 }
 func (r *memMerchantRepoAPIKey) ExistsByCode(_ context.Context, _ string) (bool, error) {
 	return false, nil
+}
+
+func (r *memMerchantRepoAPIKey) UpdateStatus(_ context.Context, id uuid.UUID, status model.MerchantStatus) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	m, ok := r.byID[id]
+	if !ok {
+		return repository.ErrMerchantNotFound
+	}
+	m.Status = status
+	return nil
 }
 
 type memKeyRepo struct {
@@ -88,6 +103,9 @@ func (r *memKeyRepo) Create(_ context.Context, key *model.MerchantAPIKey) error 
 	r.byID[key.ID] = stored
 	r.byKeyID[key.KeyID] = stored
 	return nil
+}
+func (r *memKeyRepo) CreateInTx(ctx context.Context, _ pgx.Tx, key *model.MerchantAPIKey) error {
+	return r.Create(ctx, key)
 }
 
 func (r *memKeyRepo) GetByID(_ context.Context, merchantID, id uuid.UUID) (*model.MerchantAPIKey, error) {

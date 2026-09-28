@@ -44,6 +44,10 @@ func (s *stubMerchantSvc) GetMerchantByAPIKey(_ context.Context, apiKey string) 
 	return nil, repository.ErrMerchantNotFound
 }
 
+func (s *stubMerchantSvc) UpdateMerchantStatus(_ context.Context, _ uuid.UUID, _ model.MerchantStatus) (*model.GetMerchantResponse, error) {
+	return nil, nil
+}
+
 // compile-time interface check
 var _ service.MerchantService = (*stubMerchantSvc)(nil)
 
@@ -250,7 +254,7 @@ func newTestRouterWithAuth(t *testing.T, merchantSvc service.MerchantService, pr
 
 	r := gin.New()
 	r.Use(middleware.RequestID())
-	r.Use(middleware.Auth(merchantSvc, noopAPIKeySvc()))
+	r.Use(middleware.Auth(merchantSvc, noopAPIKeySvc(), true))
 
 	r.POST("/api/v1/payments", h.Create)
 	r.GET("/api/v1/payments/:id", h.GetByID)
@@ -725,6 +729,10 @@ func TestCreatePaymentHandler_InactiveMerchant(t *testing.T) {
 		Code:   "INACT01",
 		APIKey: "pk_inactive",
 		Status: model.MerchantStatusInactive,
+		// Phase 8D.3: the state check must PASS so the lifecycle check runs —
+		// this asserts MERCHANT_INACTIVE is still reached for an auth-eligible
+		// but non-ACTIVE merchant (no lifecycle regression).
+		LegacyCredentialState: model.LegacyCredentialStateLegacy,
 	}
 	r := newTestRouterWithAuth(t, &stubMerchantSvc{merchant: inactiveMerchant})
 

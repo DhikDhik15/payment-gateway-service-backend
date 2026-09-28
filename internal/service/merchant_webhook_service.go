@@ -10,8 +10,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dhikaarta/pay-gate-backend/internal/audit"
 	"github.com/dhikaarta/pay-gate-backend/internal/model"
 	"github.com/dhikaarta/pay-gate-backend/internal/repository"
+	"github.com/dhikaarta/pay-gate-backend/internal/ssrf"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
@@ -21,6 +23,7 @@ import (
 var (
 	ErrWebhookConfigNotFound       = errors.New("merchant webhook config not found")
 	ErrWebhookInvalidURL           = errors.New("webhook url must be https")
+	ErrWebhookDestinationBlocked   = errors.New("webhook destination is not allowed")
 	ErrWebhookDeliveryNotFound     = errors.New("merchant webhook delivery not found")
 	ErrWebhookDeliveryNotRetryable = errors.New("delivery cannot be retried in its current status")
 )
@@ -93,6 +96,22 @@ func (s *merchantWebhookConfigService) Upsert(ctx context.Context, merchantID uu
 		CreatedAt:       now,
 		UpdatedAt:       now,
 	}
+	event, err := audit.NewEventFromContext(
+		ctx,
+		audit.ActionWebhookConfigChanged,
+		audit.TargetWebhookConfig,
+		audit.UUIDPtr(cfg.ID),
+		audit.UUIDPtr(merchantID),
+		map[string]any{
+			"change":           "CONFIG_UPSERTED",
+			"enabled":          true,
+			"destination_host": auditWebhookHost(cfg.URL),
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("webhook upsert: construct audit event: %w", err)
+	}
+	ctx = audit.WithEvent(ctx, event)
 	if err := s.configRepo.Upsert(ctx, cfg); err != nil {
 		return nil, fmt.Errorf("webhook upsert: %w", err)
 	}
@@ -116,6 +135,13 @@ func (s *merchantWebhookConfigService) Get(ctx context.Context, merchantID uuid.
 }
 
 func (s *merchantWebhookConfigService) RotateSecret(ctx context.Context, merchantID uuid.UUID) (*model.MerchantWebhookConfigWithSecretResponse, error) {
+	existing, err := s.configRepo.FindByMerchantID(ctx, merchantID)
+	if err != nil {
+		if errors.Is(err, repository.ErrMerchantWebhookConfigNotFound) {
+			return nil, ErrWebhookConfigNotFound
+		}
+		return nil, fmt.Errorf("webhook rotate: find config: %w", err)
+	}
 	plaintext, err := GenerateWebhookSecret()
 	if err != nil {
 		return nil, err
@@ -124,6 +150,22 @@ func (s *merchantWebhookConfigService) RotateSecret(ctx context.Context, merchan
 	if err != nil {
 		return nil, fmt.Errorf("webhook rotate: encrypt: %w", err)
 	}
+	event, err := audit.NewEventFromContext(
+		ctx,
+		audit.ActionWebhookConfigChanged,
+		audit.TargetWebhookConfig,
+		audit.UUIDPtr(existing.ID),
+		audit.UUIDPtr(merchantID),
+		map[string]any{
+			"change":           "SECRET_ROTATED",
+			"enabled":          existing.Status == model.MerchantWebhookConfigStatusActive,
+			"destination_host": auditWebhookHost(existing.URL),
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("webhook rotate: construct audit event: %w", err)
+	}
+	ctx = audit.WithEvent(ctx, event)
 	cfg, err := s.configRepo.UpdateSecret(ctx, merchantID, encrypted)
 	if err != nil {
 		if errors.Is(err, repository.ErrMerchantWebhookConfigNotFound) {
@@ -139,6 +181,32 @@ func (s *merchantWebhookConfigService) RotateSecret(ctx context.Context, merchan
 }
 
 func (s *merchantWebhookConfigService) Disable(ctx context.Context, merchantID uuid.UUID) (*model.MerchantWebhookConfigResponse, error) {
+	existing, err := s.configRepo.FindByMerchantID(ctx, merchantID)
+	if err != nil {
+		if errors.Is(err, repository.ErrMerchantWebhookConfigNotFound) {
+			return nil, ErrWebhookConfigNotFound
+		}
+		return nil, fmt.Errorf("webhook disable: find config: %w", err)
+	}
+	if existing.Status == model.MerchantWebhookConfigStatusDisabled {
+		return existing.ToConfigResponse(), nil
+	}
+	event, err := audit.NewEventFromContext(
+		ctx,
+		audit.ActionWebhookConfigChanged,
+		audit.TargetWebhookConfig,
+		audit.UUIDPtr(existing.ID),
+		audit.UUIDPtr(merchantID),
+		map[string]any{
+			"change":           "CONFIG_DISABLED",
+			"enabled":          false,
+			"destination_host": auditWebhookHost(existing.URL),
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("webhook disable: construct audit event: %w", err)
+	}
+	ctx = audit.WithEvent(ctx, event)
 	cfg, err := s.configRepo.Disable(ctx, merchantID)
 	if err != nil {
 		if errors.Is(err, repository.ErrMerchantWebhookConfigNotFound) {
@@ -180,6 +248,16 @@ func (s *merchantWebhookConfigService) GetDelivery(ctx context.Context, merchant
 }
 
 func (s *merchantWebhookConfigService) RetryDelivery(ctx context.Context, merchantID, deliveryID uuid.UUID) (*model.MerchantWebhookDeliveryResponse, error) {
+	cfg, err := s.configRepo.FindByMerchantID(ctx, merchantID)
+	if err != nil {
+		if errors.Is(err, repository.ErrMerchantWebhookConfigNotFound) {
+			return nil, ErrWebhookConfigNotFound
+		}
+		return nil, err
+	}
+	if cfg.Status != model.MerchantWebhookConfigStatusActive {
+		return nil, ErrWebhookDeliveryNotRetryable
+	}
 	d, err := s.deliveryRepo.ManualRetry(ctx, merchantID, deliveryID)
 	if err != nil {
 		if errors.Is(err, repository.ErrMerchantWebhookDeliveryNotFound) {
@@ -199,8 +277,20 @@ func (s *merchantWebhookConfigService) RetryDelivery(ctx context.Context, mercha
 	return d.ToDeliveryResponse(), nil
 }
 
+func auditWebhookHost(rawURL string) string {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	// Hostname strips userinfo, port, path, query, and fragment. It is safe
+	// operational context and never includes a bearer credential embedded in a
+	// URL.
+	return parsed.Hostname()
+}
+
 func validateWebhookURL(raw string, requireHTTPS bool) error {
-	u, err := url.ParseRequestURI(strings.TrimSpace(raw))
+	trimmed := strings.TrimSpace(raw)
+	u, err := url.ParseRequestURI(trimmed)
 	if err != nil || u.Host == "" {
 		return ErrWebhookInvalidURL
 	}
@@ -210,6 +300,17 @@ func validateWebhookURL(raw string, requireHTTPS bool) error {
 			return ErrWebhookInvalidURL
 		}
 	} else if scheme != "https" && scheme != "http" {
+		return ErrWebhookInvalidURL
+	}
+	// Phase 8D.2 (SSRF): on top of the scheme policy the destination itself
+	// must be a permitted public address/hostname. This is early feedback
+	// only — the dispatcher re-validates the STORED URL at delivery time and
+	// the guarded dialer in the outbound client enforces the policy again at
+	// connection time, where DNS is actually resolved (DNS rebinding).
+	if err := ssrf.ValidateURL(trimmed); err != nil {
+		if errors.Is(err, ssrf.ErrDestinationBlocked) {
+			return ErrWebhookDestinationBlocked
+		}
 		return ErrWebhookInvalidURL
 	}
 	return nil

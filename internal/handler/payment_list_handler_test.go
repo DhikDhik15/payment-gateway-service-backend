@@ -174,10 +174,11 @@ func TestListPaymentHandler_MissingAPIKey(t *testing.T) {
 	merchant := &model.Merchant{
 		ID: uuid.New(), Name: "Auth Merchant", Code: "AUTHM",
 		APIKey: "pk_auth", Status: model.MerchantStatusActive,
+		LegacyCredentialState: model.LegacyCredentialStateLegacy,
 	}
 	r := gin.New()
 	r.Use(middleware.RequestID())
-	r.Use(middleware.Auth(&stubMerchantSvc{merchant: merchant}, noopAPIKeySvc()))
+	r.Use(middleware.Auth(&stubMerchantSvc{merchant: merchant}, noopAPIKeySvc(), true))
 	r.GET("/api/v1/payments", h.List)
 
 	req, _ := http.NewRequest(http.MethodGet, "/api/v1/payments", nil)

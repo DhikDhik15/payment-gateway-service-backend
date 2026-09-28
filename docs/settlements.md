@@ -4,7 +4,7 @@ Settlement adalah **external accounting evidence** dari provider. Ia tidak mengg
 
 ## Import
 
-`POST /api/v1/admin/settlements/import` menerima `provider`, `settlement_ref`, dan payload provider. Phase 7C menyediakan `MOCK` importer; format provider live yang belum tervalidasi tidak diarang.
+`POST /api/v1/admin/settlements/import` menerima `provider`, `settlement_ref`, dan payload provider. Phase 7C menyediakan `MOCK` importer; format provider live yang belum tervalidasi tidak diarang. Untuk konfigurasi non-mock, import kini gagal tertutup dengan `503` sebelum data settlement diproses sampai adapter provider-specific tersedia.
 
 Import melakukan parsing, validasi, lalu menyimpan header dan seluruh item dalam satu PostgreSQL transaction. Network/provider call tidak dilakukan di dalam transaction. Payload dibatasi 1 MiB, disimpan setelah redaction secret-like fields, dan tidak pernah ditampilkan sebagai default response.
 

@@ -1,0 +1,21 @@
+# Disposable PostgreSQL only. Runtime credentials are required environment
+# variables so no password is committed. Use the documented commands in
+# docs/phase-11-2a-verification.md; tear down with `down -v`.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${PHASE11_DB_USER:?set PHASE11_DB_USER}
+      POSTGRES_PASSWORD: ${PHASE11_DB_PASSWORD:?set PHASE11_DB_PASSWORD}
+      POSTGRES_DB: ${PHASE11_DB_NAME:?set PHASE11_DB_NAME}
+    ports:
+      - "127.0.0.1:${PHASE11_DB_PORT:-55433}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - phase11_verify_pgdata:/var/lib/postgresql/data
+volumes:
+  phase11_verify_pgdata:

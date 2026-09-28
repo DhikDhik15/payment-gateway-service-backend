@@ -97,6 +97,42 @@ const (
 	CodeDashboardUserNotFound ErrorCode = "DASHBOARD_USER_NOT_FOUND"
 	CodeEmailAlreadyExists    ErrorCode = "EMAIL_ALREADY_EXISTS"
 	CodeInsufficientRole      ErrorCode = "INSUFFICIENT_ROLE"
+
+	// Merchant lifecycle error codes (Phase 7).
+	CodeInvalidStatusTransition ErrorCode = "INVALID_STATUS_TRANSITION"
+
+	// Team management error codes (Phase 8A).
+	CodeLastOwnerRequired      ErrorCode = "LAST_OWNER_REQUIRED"
+	CodeInvalidCurrentPassword ErrorCode = "INVALID_CURRENT_PASSWORD"
+	CodeInvalidRole            ErrorCode = "INVALID_ROLE"
+	CodeInvalidPassword        ErrorCode = "INVALID_PASSWORD"
+
+	// Team invitation error codes (Phase 8B).
+	CodeInvitationNotFound        ErrorCode = "INVITATION_NOT_FOUND"
+	CodeInvitationAlreadyPending  ErrorCode = "INVITATION_ALREADY_PENDING"
+	CodeInvitationAlreadyAccepted ErrorCode = "INVITATION_ALREADY_ACCEPTED"
+
+	// Outbound webhook destination policy (Phase 8D.2 — SSRF).
+	CodeWebhookDestinationBlocked ErrorCode = "WEBHOOK_DESTINATION_BLOCKED"
+
+	// Inbound HTTP request body limits (Phase 8D.2).
+	CodeRequestTooLarge ErrorCode = "REQUEST_TOO_LARGE"
+
+	// Legacy plaintext credential lifecycle (Phase 8D.3).
+	//
+	// CodeLegacyCredentialCreationDisabled (409) — creation of new row-level
+	//   legacy credentials is permanently frozen (POST /api/v1/merchants).
+	// CodeLegacyCredentialsNotEnabled (401) — a bare legacy key was presented
+	//   while LEGACY_API_CREDENTIALS_ENABLED is false (fail-safe in production).
+	//   Returned BEFORE any credential lookup, so it never confirms validity.
+	// CodeLegacyCredentialMigrationRequired (409) — disable was called while
+	//   the merchant is still in the LEGACY state; migrate first.
+	// CodeLegacyCredentialAlreadyMigrated (409) — migrate was called for a
+	//   merchant that is no longer LEGACY (including the concurrency loser).
+	CodeLegacyCredentialCreationDisabled  ErrorCode = "LEGACY_CREDENTIAL_CREATION_DISABLED"
+	CodeLegacyCredentialsNotEnabled       ErrorCode = "LEGACY_CREDENTIALS_NOT_ENABLED"
+	CodeLegacyCredentialMigrationRequired ErrorCode = "LEGACY_CREDENTIAL_MIGRATION_REQUIRED"
+	CodeLegacyCredentialAlreadyMigrated   ErrorCode = "LEGACY_CREDENTIAL_ALREADY_MIGRATED"
 )
 
 // ─── Envelope types ──────────────────────────────────────────────────────────
@@ -245,6 +281,12 @@ func ConflictWithDetails(c *gin.Context, code ErrorCode, message string, details
 // UnprocessableEntity writes HTTP 422.
 func UnprocessableEntity(c *gin.Context, code ErrorCode, message string, details any) {
 	writeError(c, http.StatusUnprocessableEntity, code, message, details)
+}
+
+// PayloadTooLarge writes HTTP 413 (request body exceeds the configured
+// HTTP_MAX_BODY_BYTES limit).
+func PayloadTooLarge(c *gin.Context, code ErrorCode, message string) {
+	writeError(c, http.StatusRequestEntityTooLarge, code, message, nil)
 }
 
 // TooManyRequests writes HTTP 429.

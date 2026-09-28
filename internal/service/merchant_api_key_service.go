@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dhikaarta/pay-gate-backend/internal/audit"
 	"github.com/dhikaarta/pay-gate-backend/internal/model"
 	"github.com/dhikaarta/pay-gate-backend/internal/repository"
 	"github.com/google/uuid"
@@ -128,6 +129,22 @@ func (s *merchantAPIKeyService) CreateKey(ctx context.Context, merchantID uuid.U
 		UpdatedAt:  now,
 	}
 
+	event, err := audit.NewEventFromContext(
+		ctx,
+		audit.ActionAPIKeyCreated,
+		audit.TargetAPIKey,
+		audit.UUIDPtr(key.ID),
+		audit.UUIDPtr(merchantID),
+		map[string]any{
+			"credential_id":   key.ID,
+			"credential_type": "API_KEY",
+			"key_id":          key.KeyID,
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create key: construct audit event: %w", err)
+	}
+	ctx = audit.WithEvent(ctx, event)
 	if err := s.keyRepo.Create(ctx, key); err != nil {
 		return nil, fmt.Errorf("create key: persist: %w", err)
 	}
@@ -169,7 +186,22 @@ func (s *merchantAPIKeyService) ListKeys(ctx context.Context, merchantID uuid.UU
 // ─── RevokeKey ────────────────────────────────────────────────────────────────
 
 func (s *merchantAPIKeyService) RevokeKey(ctx context.Context, merchantID, keyID uuid.UUID) error {
-	err := s.keyRepo.Revoke(ctx, merchantID, keyID)
+	event, err := audit.NewEventFromContext(
+		ctx,
+		audit.ActionAPIKeyRevoked,
+		audit.TargetAPIKey,
+		audit.UUIDPtr(keyID),
+		audit.UUIDPtr(merchantID),
+		map[string]any{
+			"credential_id":   keyID,
+			"credential_type": "API_KEY",
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("revoke key: construct audit event: %w", err)
+	}
+	ctx = audit.WithEvent(ctx, event)
+	err = s.keyRepo.Revoke(ctx, merchantID, keyID)
 	if err != nil {
 		if errors.Is(err, repository.ErrMerchantAPIKeyNotFound) {
 			return ErrAPIKeyNotFound
@@ -220,6 +252,24 @@ func (s *merchantAPIKeyService) RotateKey(ctx context.Context, merchantID, keyID
 		CreatedAt:  now,
 		UpdatedAt:  now,
 	}
+
+	event, err := audit.NewEventFromContext(
+		ctx,
+		audit.ActionAPIKeyRotated,
+		audit.TargetAPIKey,
+		audit.UUIDPtr(newKey.ID),
+		audit.UUIDPtr(merchantID),
+		map[string]any{
+			"old_credential_id": keyID,
+			"new_credential_id": newKey.ID,
+			"credential_type":   "API_KEY",
+			"new_key_id":        newKey.KeyID,
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("rotate key: construct audit event: %w", err)
+	}
+	ctx = audit.WithEvent(ctx, event)
 
 	// Atomic: revoke old key and insert new key in one transaction.
 	if err := s.keyRepo.Rotate(ctx, merchantID, keyID, newKey); err != nil {

@@ -60,7 +60,7 @@ See [docs/architecture.md](docs/architecture.md) for a detailed explanation of e
 
 | Component       | Choice                          |
 |-----------------|---------------------------------|
-| Language        | Go 1.24                         |
+| Language        | Go 1.25                         |
 | HTTP framework  | Gin v1.10                       |
 | Database        | PostgreSQL 16                   |
 | DB driver       | pgx v5                          |
@@ -73,7 +73,7 @@ See [docs/architecture.md](docs/architecture.md) for a detailed explanation of e
 
 ## Requirements
 
-- Go 1.24+
+- Go 1.25+
 - Docker & Docker Compose v2
 - `golang-migrate` CLI (for local migrations)
 - `swag` CLI (for Swagger regeneration, optional)
@@ -99,15 +99,24 @@ go install github.com/swaggo/swag/cmd/swag@latest
 git clone <repo-url>
 cd pay-gate-backend
 
-# Start services
+# Create a local-only environment file and set DB_USER/DB_PASSWORD.
+cp .env.example .env
+
+# Start the app and one-shot migration job (PostgreSQL is external).
 docker compose up -d --build
 
-# Verify
-curl http://localhost:8080/health
+# Verify (Compose publishes the app on localhost:8081).
+curl http://localhost:8081/health
+curl http://localhost:8081/health/ready
 # {"success":true,"data":{"status":"ok"},"meta":{"request_id":"req_xxx"}}
 ```
 
-PostgreSQL data is persisted in the `pay-gate-postgres-data` Docker volume.
+The Compose file does not provision PostgreSQL or publish a database port.
+Provision a separate PostgreSQL instance and set `DB_HOST`, `DB_PORT`,
+`DB_USER`, `DB_PASSWORD`, and `DB_NAME` in the local `.env` file. For production
+and staging, use the contract and deployment sequence in
+[docs/phase-9-production-runbook.md](docs/phase-9-production-runbook.md) and
+[docs/phase-9-production-checklist.md](docs/phase-9-production-checklist.md).
 
 ---
 
@@ -122,24 +131,54 @@ cp .env.example .env
 | Variable      | Default            | Description                          |
 |---------------|--------------------|--------------------------------------|
 | `APP_NAME`    | `payment-gateway`  | Application name (used in logs)      |
-| `APP_ENV`     | `development`      | `development` or `production`        |
-| `APP_PORT`    | `8080`             | HTTP listen port                     |
-| `DB_HOST`     | `localhost`        | PostgreSQL host                      |
+| `APP_ENV`     | `development`      | `development`, `test`, or `production`; production requires the full Phase 9 contract |
+| `APP_PORT`    | `8080`             | HTTP listen port; must be 1–65535. In Docker Compose this is the container port (8080), while the host publishes 8081 |
+| `FRONTEND_PUBLIC_URL` | _(required for mock)_ | Browser-facing origin serving the public `/pay/:identifier` React route; independent from `APP_PORT` and the API origin |
+| `MOCK_PAYMENT_BASE_URL` | _(deprecated)_ | Legacy compatibility alias for `FRONTEND_PUBLIC_URL`; new deployments should not use it |
+| `DB_HOST`     | `localhost`        | PostgreSQL host; Compose defaults to `host.docker.internal` |
 | `DB_PORT`     | `5432`             | PostgreSQL port                      |
 | `DB_USER`     | `payment`          | PostgreSQL user                      |
 | `DB_PASSWORD` | `payment`          | PostgreSQL password                  |
 | `DB_NAME`     | `payment_gateway`  | Database name                        |
-| `DB_SSLMODE`  | `disable`          | PostgreSQL SSL mode                  |
+| `DB_SSLMODE`  | `disable`          | Development default; production requires `verify-full` |
 | `IDEMPOTENCY_TTL` | `24h`           | How long a payment idempotency key can be replayed |
 | `ADMIN_API_KEY` | _(empty)_ | Ops/admin bootstrap key (`X-Admin-Key`); empty disables admin routes |
-| `AUTH_JWT_SECRET` | _(dev default)_ | JWT signing secret for dashboard auth; **required in production** |
+| `AUTH_JWT_SECRET` | _(dev default)_ | JWT signing secret for dashboard auth; **required and at least 32 bytes in production** |
 | `AUTH_ACCESS_TOKEN_TTL` | `15m` | Short-lived dashboard access token lifetime |
 | `AUTH_REFRESH_TOKEN_TTL` | `168h` | Refresh session / cookie lifetime |
+| `INVITATION_TOKEN_TTL` | `48h` | Team invitation token validity |
+| `DASHBOARD_BASE_URL` | _(empty)_ | Public dashboard SPA origin for invitation links (`{base}/accept-invitation?token=…`); required when `EMAIL_ENABLED=true` |
+| `EMAIL_ENABLED` | `false` | Outbound email via SMTP (`SMTP_*` vars); disabled = no-op sender — invitations still work |
 | `CORS_ALLOWED_ORIGINS` | _(empty)_ | Comma-separated SPA origins (e.g. `http://localhost:5173`) |
+| `LEGACY_API_CREDENTIALS_ENABLED` | `true` in development/test, **`false` otherwise** | Phase 8D.3 migration window for legacy plaintext API keys. Unset = environment default; an invalid value **fails startup**. Creation of new legacy credentials is frozen regardless of this value |
+
+For the mock provider, `FRONTEND_PUBLIC_URL` is the browser-facing origin that
+serves the React `/pay/:identifier` route. It is independent from both
+`APP_PORT` and the backend API origin. The backend uses it only to construct
+the provider-returned PaymentURL; the frontend treats that URL as opaque and
+does not rewrite it. Set it explicitly for every mock-enabled environment.
+`MOCK_PAYMENT_BASE_URL` is retained only as a deprecated compatibility alias.
 
 > **Never commit `.env` to version control.**
 
 Dashboard auth is separate from merchant API keys. See [docs/phase-8-auth-design.md](docs/phase-8-auth-design.md) and [docs/phase-8-dashboard-auth-api.md](docs/phase-8-dashboard-auth-api.md).
+
+Production provider mode currently wires payment creation/cancellation to the
+selected provider, but refund and settlement adapters remain mock-shaped. The
+dashboard refund endpoint fails closed for non-mock providers; do not advertise
+refund/settlement production support until provider-specific adapters are
+implemented. See [docs/phase-9-production-runbook.md](docs/phase-9-production-runbook.md).
+
+### Legacy plaintext API keys (Phase 8D.3)
+
+Row-level legacy keys (`X-API-Key: pk_<hex>`) authenticate only while the
+migration window is open **and** the merchant's `legacy_credential_state`
+allows it. Creating new legacy credentials is permanently frozen —
+`POST /api/v1/merchants` always returns `409 LEGACY_CREDENTIAL_CREATION_DISABLED`.
+Existing tenants migrate to the canonical Phase 5C key system with
+`POST /api/v1/dashboard/legacy-credential/migrate` (secret returned once), then
+cut the legacy key off with `/disable` (idempotent).
+See [docs/legacy-credentials.md](docs/legacy-credentials.md).
 
 ### Payment idempotency
 
@@ -171,11 +210,18 @@ go run ./cmd/server
 ## Database Migration
 
 ```bash
-# Apply all migrations
-make migrate-up
+# Apply all migrations (the URL is intentionally explicit; no default is embedded)
+DATABASE_URL='postgres://<user>:<password>@<db-host>:5432/<db-name>?sslmode=verify-full' \
+  make migrate-up
 
-# Roll back last migration
-make migrate-down
+# Show the current version and dirty state
+DATABASE_URL='postgres://<user>:<password>@<db-host>:5432/<db-name>?sslmode=verify-full' \
+  make migrate-status
+
+# Destructive rollback is refused unless explicitly approved.
+ALLOW_DESTRUCTIVE_DOWN=true \
+DATABASE_URL='postgres://<user>:<password>@<db-host>:5432/<db-name>?sslmode=verify-full' \
+  make migrate-down
 
 # Create a new migration
 make migrate-create name=add_users
@@ -190,17 +236,21 @@ Migrations live in `./migrations/`.
 ```
 make run            Run server locally
 make build          Build binary to ./bin/server
-make test           Run all unit tests
+make test           Run all unit tests with race detection
+make test-integration  Run PostgreSQL-backed tests (requires TEST_DATABASE_URL)
 make fmt            Format Go source files
+make fmt-check      Fail if Go source files need formatting
 make vet            Run go vet
 
-make docker-up      Build & start all Docker services
-make docker-down    Stop containers (volumes preserved)
+make docker-up      Build and start the app + one-shot migration (external DB)
+make docker-down    Stop Compose containers (external DB is unaffected)
 make docker-build   Build Docker image only
+make docker-validate Validate Compose configuration
 make docker-logs    Tail all container logs
 
-make migrate-up     Apply pending migrations
-make migrate-down   Roll back last migration
+make migrate-up     Apply pending migrations (requires DATABASE_URL/DB_URL)
+make migrate-status Show migration version and dirty state
+make migrate-down   Guarded, destructive rollback (explicit approval required)
 make migrate-create name=<name>   Create new migration pair
 
 make swagger        Regenerate Swagger docs
@@ -216,9 +266,11 @@ All merchant payment endpoints require the `X-API-Key` header.
 | Method | Path                           | Auth | Description                |
 |--------|--------------------------------|------|----------------------------|
 | GET    | /health                        | No   | Liveness check             |
-| GET    | /health/ready                  | No   | Readiness check (DB ping)  |
-| POST   | /api/v1/merchants              | No   | Register a merchant        |
-| GET    | /api/v1/merchants/:id          | No   | Get merchant details       |
+| GET    | /health/ready                  | No   | Readiness check (DB + clean schema) |
+| POST   | /api/v1/merchants              | Admin  | **FROZEN** — always `409 LEGACY_CREDENTIAL_CREATION_DISABLED` |
+| GET    | /api/v1/merchants/:id          | Admin  | Get merchant details       |
+| POST   | /api/v1/dashboard/legacy-credential/migrate | JWT (OWNER/ADMIN) | Migrate legacy credential; new Phase 5C secret returned once |
+| POST   | /api/v1/dashboard/legacy-credential/disable | JWT (OWNER/ADMIN) | Disable legacy credential (idempotent) |
 | POST   | /api/v1/merchants/:id/webhook  | Yes  | Configure outbound webhook |
 | GET    | /api/v1/merchants/:id/webhook  | Yes  | Get webhook config         |
 | POST   | /api/v1/merchants/:id/webhook/rotate | Yes | Rotate webhook secret |
@@ -229,7 +281,7 @@ All merchant payment endpoints require the `X-API-Key` header.
 | POST   | /api/v1/payments               | Yes  | Create a payment (`Idempotency-Key` required) |
 | GET    | /api/v1/payments/:id           | Yes  | Get payment details        |
 | POST   | /api/v1/payments/:id/cancel    | Yes  | Cancel a payment           |
-| POST   | /api/v1/payments/:id/refunds   | Yes  | Create a refund (`Idempotency-Key` required) |
+| POST   | /api/v1/payments/:id/refunds   | Yes  | Create a refund (`Idempotency-Key` required); unavailable for non-mock providers until a real adapter is configured |
 | GET    | /api/v1/payments/:id/refunds   | Yes  | List refunds for a payment |
 | GET    | /api/v1/refunds/:id            | Yes  | Get refund details         |
 

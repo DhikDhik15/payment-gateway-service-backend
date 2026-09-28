@@ -48,15 +48,19 @@ boundaries.
 | Middleware | Responsibility |
 |------------|----------------|
 | `RequestID` | Reads or generates `X-Request-ID`, stores in context, echoes in response header |
+| `CORS` | Applies explicit-origin browser policy; preflight still carries the request ID |
 | `Auth` | Reads `X-API-Key`, looks up merchant, validates ACTIVE status, stores merchant in context |
 | `gin.Recovery` | Catches panics, returns 500 without crashing the server |
-| `requestLogger` | Structured JSON log line per request after all handlers run |
+| `requestLogger` | Structured JSON log line per request after all handlers run; logs route templates, not raw token paths |
+| `MaxBodyBytes` | Bounds declared and chunked request bodies before handlers/readers |
 
 Middleware runs in this order:
-1. Recovery (must be first — catches panics from all subsequent handlers)
-2. RequestID (stamps every request)
-3. Logger (runs after request completes so it can log the final status code)
-4. Auth (route-group level — only on protected endpoints)
+1. Recovery (catches panics from subsequent handlers)
+2. RequestID (stamps every request, including CORS preflight)
+3. CORS (applies the explicit browser-origin policy)
+4. Logger (runs after request completes so it can log the final status code)
+5. BodyLimit (caps bodies before handlers or route middleware read them)
+6. Auth (route-group level — only on protected endpoints)
 
 ### Handler (`internal/handler/`)
 
@@ -106,6 +110,18 @@ Repositories must **not** contain:
 - State transition validation
 - Payment provider calls
 
+### Security audit (`internal/audit/` and `internal/service/audit_service.go`)
+
+Phase 8D.5 uses one append-only `AuditService`/`AuditLogRepository` pair.
+Services attach an explicit, validated event to the request context; repositories
+that own a PostgreSQL transaction insert that event before `COMMIT`. This keeps
+the Phase 8D.4 merchant/OWNER lock and Phase 8D.3 credential transitions
+transactionally consistent. The repository has no update/delete operation, and
+tenant-scoped reads always bind `merchant_id`. Failed shared-key admin
+authentication uses the separate best-effort path and never changes the auth
+response. See `docs/phase-8d5-security-audit.md` for the event, metadata, and
+retention policies.
+
 #### Payment Listing SQL Design
 
 The listing query is constructed by `buildListQuery` in `transaction_repository.go`.
@@ -153,7 +169,8 @@ type PaymentProvider interface {
 
 - **Never makes external HTTP calls**
 - Generates `MOCK-TXN-{hex8}` provider transaction IDs
-- Generates `https://mock-payment.local/pay/MOCK-TXN-{hex8}` payment URLs
+- Generates `{FRONTEND_PUBLIC_URL}/pay/MOCK-TXN-{hex32}` payment URLs; the
+  backend config supplies the browser-facing frontend origin, not its API port
 - Sets `expired_at` to 30 minutes in the future
 - Configurable failure modes via struct fields:
   - `ShouldFailCreate` — makes `CreatePayment` return `ErrProviderFailure`
@@ -269,3 +286,4 @@ the transaction row means a single indexed lookup — no join to `payment_attemp
 | Rate limiting | Add Gin middleware before `Auth` |
 | Settlement | Admin import service + evidence tables; reconciliation is explicit and never changes payment/refund truth |
 | Refund | New service + DB table, from PAID state |
+| Transactional email | `EmailSender` interface with SMTP + no-op implementations (Phase 8C.1); invitation creation renders the email and commits it into the `email_outbox` transactional outbox **in the same transaction** as the invitation row (Phase 8C.3A) — invitation exists ⇔ queued email exists, and **SMTP is not on the request critical path**. Two independent in-process workers now own `email_outbox`, with **disjoint state machines**: `EmailOutboxWorker` + dispatcher (Phase 8C.3B, structural mirror of the merchant webhook worker) owns `PENDING`/`PROCESSING` — claims due rows with `FOR UPDATE SKIP LOCKED`, recovers stale PROCESSING rows, classifies permanent (SMTP 5xx / invalid message) vs retryable failures, retries on the shared webhook backoff+jitter schedule, and dead-letters at max attempts — **at-least-once** delivery (duplicate SMTP submissions possible after a crash); `EmailOutboxCleanupWorker` (Phase 8C.3C, `ExpiryWorker` pattern, `EMAIL_CLEANUP_ENABLED` opt-in, default off) owns **terminal retention only** — a bounded batched full-row `DELETE` (never a giant scan: `EMAIL_CLEANUP_BATCH_SIZE` per call, drained to zero with a hard per-run batch cap) of `SENT` rows older than **7 days** (`sent_at`, strict `<`) and `DEAD` rows older than **30 days** (`updated_at`, strict `<`), on an `EMAIL_CLEANUP_INTERVAL` ticker with an immediate first run. Cleanup **never** touches `PENDING` or `PROCESSING` regardless of age (stale recovery stays exclusively with the delivery worker) and **never** touches `merchant_user_invitations` — the invitation table remains the sole authority for invitation validity, and `email_outbox.reference_id` is a deliberate non-FK correlation id. Run logs carry counts/duration only (no recipient/subject/body/token) |

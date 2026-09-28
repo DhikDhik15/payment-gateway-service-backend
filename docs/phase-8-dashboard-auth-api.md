@@ -92,14 +92,25 @@ The cookie is set automatically by the browser for future `/api/v1/auth/*` reque
 
 ### POST /api/v1/auth/logout
 
-Revoke the current session. Always succeeds from the client's perspective.
+Revoke the current refresh session and clear the browser continuation cookie.
+The endpoint is idempotent.
 
 **Request headers:**
 ```
-Authorization: Bearer <access_token>   (optional, logout works without it)
+Authorization: Bearer <access_token>   (recommended; supplies stable sid)
 ```
 
-The browser automatically sends the `refresh_token` HttpOnly cookie.
+The browser automatically sends the `refresh_token` HttpOnly cookie. A valid
+access token lets the backend revoke the exact session row even when a refresh
+rotation races with logout. Legacy/header-only callers can still identify the
+current session by refresh-token hash.
+
+**Access-token semantics:** this is a bounded stateless contract. Logout does
+not blacklist an already-issued access JWT; it remains accepted until its `exp`
+claim (default `AUTH_ACCESS_TOKEN_TTL`, normally 15 minutes). Logout does
+guarantee that the invalidated refresh session cannot issue another token.
+Disabled users and INACTIVE/SUSPENDED merchants remain blocked immediately by
+the per-request database lifecycle checks.
 
 **Success response (200):**
 ```json

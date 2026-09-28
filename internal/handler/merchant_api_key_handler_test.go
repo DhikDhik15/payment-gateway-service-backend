@@ -20,6 +20,7 @@ import (
 	"github.com/dhikaarta/pay-gate-backend/pkg/response"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 )
 
 // ─── In-memory repos for API key handler tests ────────────────────────────────
@@ -44,6 +45,9 @@ func (r *apiKeyMemMerchantRepo) Create(_ context.Context, m *model.Merchant) err
 	r.byAPIKey[m.APIKey] = m
 	return nil
 }
+func (r *apiKeyMemMerchantRepo) CreateInTx(ctx context.Context, _ pgx.Tx, m *model.Merchant) error {
+	return r.Create(ctx, m)
+}
 func (r *apiKeyMemMerchantRepo) GetByID(_ context.Context, id uuid.UUID) (*model.Merchant, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -66,6 +70,10 @@ func (r *apiKeyMemMerchantRepo) GetByAPIKey(_ context.Context, apiKey string) (*
 }
 func (r *apiKeyMemMerchantRepo) ExistsByCode(_ context.Context, _ string) (bool, error) {
 	return false, nil
+}
+
+func (r *apiKeyMemMerchantRepo) UpdateStatus(_ context.Context, _ uuid.UUID, _ model.MerchantStatus) error {
+	return nil
 }
 
 type apiKeyMemKeyRepo struct {
@@ -108,6 +116,9 @@ func (r *apiKeyMemKeyRepo) Create(_ context.Context, key *model.MerchantAPIKey) 
 	r.byID[key.ID] = stored
 	r.byKeyID[key.KeyID] = stored
 	return nil
+}
+func (r *apiKeyMemKeyRepo) CreateInTx(ctx context.Context, _ pgx.Tx, key *model.MerchantAPIKey) error {
+	return r.Create(ctx, key)
 }
 func (r *apiKeyMemKeyRepo) GetByID(_ context.Context, merchantID, id uuid.UUID) (*model.MerchantAPIKey, error) {
 	r.mu.Lock()
@@ -204,13 +215,15 @@ func newAPIKeyTestRouter(t *testing.T) *apiKeyTestDeps {
 	merchantA := &model.Merchant{
 		ID: uuid.New(), Name: "Alpha", Code: "ALPHA",
 		APIKey: legacyA, Status: model.MerchantStatusActive,
-		CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+		LegacyCredentialState: model.LegacyCredentialStateLegacy,
+		CreatedAt:             time.Now().UTC(), UpdatedAt: time.Now().UTC(),
 	}
 	legacyB := "pk_legacy_beta_" + uuid.New().String()
 	merchantB := &model.Merchant{
 		ID: uuid.New(), Name: "Beta", Code: "BETA",
 		APIKey: legacyB, Status: model.MerchantStatusActive,
-		CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+		LegacyCredentialState: model.LegacyCredentialStateLegacy,
+		CreatedAt:             time.Now().UTC(), UpdatedAt: time.Now().UTC(),
 	}
 	_ = mRepo.Create(context.Background(), merchantA)
 	_ = mRepo.Create(context.Background(), merchantB)
@@ -224,7 +237,7 @@ func newAPIKeyTestRouter(t *testing.T) *apiKeyTestDeps {
 	// Mirror production routing: share :id with GET /merchants/:id; key uses :key_id.
 	merchants := r.Group("/api/v1/merchants")
 	apiKeys := merchants.Group("/:id/api-keys")
-	apiKeys.Use(middleware.Auth(merchantSvc, keySvc))
+	apiKeys.Use(middleware.Auth(merchantSvc, keySvc, true))
 	{
 		apiKeys.POST("", h.CreateAPIKey)
 		apiKeys.GET("", h.ListAPIKeys)

@@ -100,6 +100,26 @@ func testSettlementPayload(fee int64) model.ImportSettlementRequest {
 	}
 }
 
+func TestSettlementService_AllowsMockProviderInDevelopmentWiring(t *testing.T) {
+	repo := newConcurrentSettlementRepository()
+	svc := NewSettlementServiceForProvider(repo, "mock", NewMockSettlementImporter())
+	if _, _, err := svc.Import(context.Background(), testSettlementPayload(0)); err != nil {
+		t.Fatalf("mock settlement import failed: %v", err)
+	}
+}
+
+func TestSettlementService_RejectsUnconfiguredNonMockProvider(t *testing.T) {
+	repo := newConcurrentSettlementRepository()
+	svc := NewSettlementServiceForProvider(repo, "midtrans", NewMockSettlementImporter())
+	_, _, err := svc.Import(context.Background(), testSettlementPayload(0))
+	if !errors.Is(err, ErrSettlementProviderUnsupported) {
+		t.Fatalf("error = %v, want ErrSettlementProviderUnsupported", err)
+	}
+	if len(repo.settlements) != 0 {
+		t.Fatal("unsupported settlement import wrote a settlement row")
+	}
+}
+
 func TestSettlementImportConcurrentReplay(t *testing.T) {
 	repo := newConcurrentSettlementRepository()
 	svc := NewSettlementService(repo, NewMockSettlementImporter())

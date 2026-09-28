@@ -10,6 +10,26 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+func TestCORS_PreflightCarriesRequestID(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(middleware.RequestID())
+	r.Use(middleware.CORS("http://localhost:5173"))
+	r.GET("/test", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	req := httptest.NewRequest(http.MethodOptions, "/test", nil)
+	req.Header.Set("Origin", "http://localhost:5173")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("preflight status = %d, want %d", w.Code, http.StatusNoContent)
+	}
+	if w.Header().Get("X-Request-ID") == "" {
+		t.Fatal("preflight response did not carry X-Request-ID")
+	}
+}
+
 func TestCORS(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -36,6 +56,10 @@ func TestCORS(t *testing.T) {
 
 		if got := w.Header().Get("Access-Control-Allow-Credentials"); got != "true" {
 			t.Errorf("Access-Control-Allow-Credentials: got %q, want %q", got, "true")
+		}
+
+		if exposed := w.Header().Get("Access-Control-Expose-Headers"); !strings.Contains(exposed, "X-Request-ID") || !strings.Contains(exposed, "Retry-After") {
+			t.Errorf("Access-Control-Expose-Headers = %q, want request/retry headers", exposed)
 		}
 
 		if got := w.Header().Get("Vary"); got != "Origin" {

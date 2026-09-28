@@ -411,16 +411,47 @@ func paidTransaction(merchantID uuid.UUID, amount int64) (*mockTransactionRepo, 
 	return txRepo, tx
 }
 
-func buildRefundService(txRepo *mockTransactionRepo, provider *service.MockRefundProvider) (service.RefundService, *memRefundRepo, *memRefundAttemptRepo, *memRefundIdempotencyRepo) {
+func buildRefundService(txRepo *mockTransactionRepo, provider *service.MockRefundProvider, configuredProvider ...string) (service.RefundService, *memRefundRepo, *memRefundAttemptRepo, *memRefundIdempotencyRepo) {
 	refundRepo := newMemRefundRepo(txRepo)
 	attemptRepo := newMemRefundAttemptRepo()
 	idempRepo := newMemRefundIdempotencyRepo()
-	svc := service.NewRefundService(txRepo, refundRepo, attemptRepo, idempRepo, provider, nil, 24*time.Hour)
+	svc := service.NewRefundService(txRepo, refundRepo, attemptRepo, idempRepo, provider, nil, 24*time.Hour, configuredProvider...)
 	return svc, refundRepo, attemptRepo, idempRepo
 }
 
 func refundReq(amount int64) model.CreateRefundRequest {
 	return model.CreateRefundRequest{Amount: amount, Currency: "IDR"}
+}
+
+func TestRefundService_AllowsMockProviderInDevelopmentWiring(t *testing.T) {
+	mid := uuid.New()
+	txRepo, tx := paidTransaction(mid, 100_000)
+	provider := service.NewMockRefundProvider()
+	svc, _, _, _ := buildRefundService(txRepo, provider, "mock")
+	if _, err := svc.CreateRefundWithIdempotency(context.Background(), mid, tx.ID, refundReq(100_000), "mock-provider-supported"); err != nil {
+		t.Fatalf("mock refund failed: %v", err)
+	}
+	if provider.CreateRefundCallCount() != 1 {
+		t.Fatalf("mock provider call count = %d, want 1", provider.CreateRefundCallCount())
+	}
+}
+
+func TestRefundService_RejectsNonMockProviderBeforeReservation(t *testing.T) {
+	mid := uuid.New()
+	txRepo, tx := paidTransaction(mid, 100_000)
+	provider := service.NewMockRefundProvider()
+	svc, _, _, idempotency := buildRefundService(txRepo, provider, "midtrans")
+
+	_, err := svc.CreateRefundWithIdempotency(context.Background(), mid, tx.ID, refundReq(100_000), "unsupported-provider")
+	if !errors.Is(err, service.ErrRefundProviderUnsupported) {
+		t.Fatalf("error = %v, want ErrRefundProviderUnsupported", err)
+	}
+	if provider.CreateRefundCallCount() != 0 {
+		t.Fatalf("unsupported provider called mock adapter %d times", provider.CreateRefundCallCount())
+	}
+	if idempotency == nil {
+		t.Fatal("idempotency repository unexpectedly nil")
+	}
 }
 
 // ─── Create refund — happy path ───────────────────────────────────────────────

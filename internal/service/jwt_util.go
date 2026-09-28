@@ -42,12 +42,13 @@ var (
 // jwtClaims is the JWT payload for a dashboard access token.
 // Fields intentionally minimal — never include sensitive data.
 type jwtClaims struct {
-	Subject    string `json:"sub"`  // MerchantUser UUID
-	MerchantID string `json:"mid"`  // Merchant UUID (for fast isolation checks)
-	Role       string `json:"role"` // DashboardUserRole string
-	IssuedAt   int64  `json:"iat"`  // Unix timestamp
-	ExpiresAt  int64  `json:"exp"`  // Unix timestamp
-	JTI        string `json:"jti"`  // Unique token ID (JWT ID)
+	Subject    string `json:"sub"`           // MerchantUser UUID
+	MerchantID string `json:"mid"`           // Merchant UUID (for fast isolation checks)
+	Role       string `json:"role"`          // DashboardUserRole string
+	IssuedAt   int64  `json:"iat"`           // Unix timestamp
+	ExpiresAt  int64  `json:"exp"`           // Unix timestamp
+	JTI        string `json:"jti"`           // Unique token ID (JWT ID)
+	SessionID  string `json:"sid,omitempty"` // Stable dashboard session ID; not a secret
 }
 
 // signJWT creates a signed HS256 JWT using only standard library packages.

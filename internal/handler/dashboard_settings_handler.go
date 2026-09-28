@@ -56,11 +56,13 @@ func (h *DashboardSettingsHandler) GetSettings(c *gin.Context) {
 	}
 
 	response.OK(c, model.DashboardMerchantSettingsResponse{
-		ID:        m.ID,
-		Name:      m.Name,
-		Code:      m.Code,
-		Status:    m.Status,
-		CreatedAt: m.CreatedAt,
-		UpdatedAt: m.UpdatedAt,
+		ID:                         m.ID,
+		Name:                       m.Name,
+		Code:                       m.Code,
+		Status:                     m.Status,
+		CreatedAt:                  m.CreatedAt,
+		UpdatedAt:                  m.UpdatedAt,
+		LegacyCredentialState:      m.LegacyCredentialState,
+		LegacyCredentialDisabledAt: m.LegacyCredentialDisabledAt,
 	})
 }
