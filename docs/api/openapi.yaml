@@ -1,0 +1,1340 @@
+openapi: 3.1.0
+info:
+  title: Payment Gateway — External Merchant API
+  description: |
+    Merchant-facing API for payment creation, retrieval, cancellation, refunds, and webhook configuration.
+
+    ## Authentication
+
+    All requests require an API key sent via the `X-API-Key` header.
+
+    **Compound credential format:** `pk_<hex>:sk_<hex>`
+
+    The API key determines the merchant identity. Clients must never send a `merchant_id` —
+    it is always derived from the authenticated API key.
+
+    ## Idempotency
+
+    Payment creation and refund creation require an `Idempotency-Key` header (1–255 chars).
+    The key is scoped per merchant. Same key + same payload returns the stored result.
+    Same key + different payload returns `409 IDEMPOTENCY_KEY_REUSED`.
+
+    ## Rate Limiting
+
+    - 120 requests/minute per authenticated merchant
+    - 120 requests/minute per client IP (pre-auth)
+    - 429 returned when exceeded, with `Retry-After` header
+  version: 1.0.0
+  contact:
+    name: Payment Gateway Support
+servers:
+  - url: http://localhost:8080
+    description: Development
+  - url: https://api.example.com
+    description: Production
+tags:
+  - name: Payments
+    description: Payment lifecycle operations
+  - name: Refunds
+    description: Refund operations
+  - name: Webhooks
+    description: Merchant webhook configuration and delivery inspection
+paths:
+  /api/v1/payments:
+    get:
+      tags: [Payments]
+      summary: List payments
+      description: |
+        Returns a paginated, filtered list of transactions for the authenticated merchant.
+        Results are always scoped to the merchant derived from the X-API-Key.
+      operationId: listPayments
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+        - $ref: '#/components/parameters/StatusFilter'
+        - $ref: '#/components/parameters/MerchantOrderIdFilter'
+        - $ref: '#/components/parameters/PaymentMethodFilter'
+        - $ref: '#/components/parameters/CreatedFromParam'
+        - $ref: '#/components/parameters/CreatedToParam'
+      responses:
+        '200':
+          $ref: '#/components/responses/PaymentListResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    post:
+      tags: [Payments]
+      summary: Create a payment
+      description: |
+        Initiates a new payment for the authenticated merchant.
+
+        **Idempotency:** `Idempotency-Key` (1–255 chars, required) scopes the request to the
+        authenticated merchant. The key and the request body are hashed together; the hash is
+        compared on every replay.
+
+        - Same key + same payload → replays stored result (201)
+        - Same key + different payload → 409 IDEMPOTENCY_KEY_REUSED
+        - Concurrent same key → 409 IDEMPOTENCY_REQUEST_IN_PROGRESS
+        - Provider timeout stored as FAILED; replay returns same 504
+        - Records expire after IDEMPOTENCY_TTL (default 24h)
+      operationId: createPayment
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreatePaymentRequest'
+            examples:
+              default:
+                value:
+                  merchant_order_id: ORDER-2026-0001
+                  amount: 150000
+                  currency: IDR
+                  payment_method: QRIS
+      responses:
+        '201':
+          $ref: '#/components/responses/PaymentCreatedResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '409':
+          $ref: '#/components/responses/ConflictError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  /api/v1/payments/{id}:
+    get:
+      tags: [Payments]
+      summary: Get a payment
+      description: |
+        Returns the payment details. The transaction must belong to the authenticated merchant.
+        A payment belonging to another merchant is reported as 404 (no existence leak).
+      operationId: getPayment
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/PaymentIdParam'
+      responses:
+        '200':
+          description: Payment found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Payment'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  /api/v1/payments/{id}/cancel:
+    post:
+      tags: [Payments]
+      summary: Cancel a payment
+      description: |
+        Cancels a CREATED or PENDING transaction. PAID, FAILED, EXPIRED, and CANCELLED
+        transactions cannot be cancelled.
+      operationId: cancelPayment
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/PaymentIdParam'
+      responses:
+        '200':
+          description: Payment cancelled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Payment'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '409':
+          $ref: '#/components/responses/ConflictError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  /api/v1/payments/{id}/refunds:
+    post:
+      tags: [Refunds]
+      summary: Create a refund
+      description: |
+        Creates a partial or full refund against a PAID payment transaction.
+
+        **Over-refund protection:** Both PENDING and PROCESSING refunds count against the
+        refundable balance, preventing double-spend. Maximum total refundable = transaction amount.
+        Partial refunds supported. Provider timeout → refund stays PENDING with reservation held.
+
+        Idempotency behavior matches payment creation.
+      operationId: createRefund
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/PaymentIdParam'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRefundRequest'
+            examples:
+              partial:
+                value:
+                  amount: 50000
+                  currency: IDR
+                  reason: Customer request
+      responses:
+        '201':
+          $ref: '#/components/responses/RefundCreatedResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '409':
+          $ref: '#/components/responses/ConflictError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    get:
+      tags: [Refunds]
+      summary: List refunds for a payment
+      description: Returns a paginated list of refunds for a specific PAID payment.
+      operationId: listRefunds
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/PaymentIdParam'
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+        - $ref: '#/components/parameters/RefundStatusFilter'
+      responses:
+        '200':
+          description: Refund list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Refund'
+                  meta:
+                    $ref: '#/components/schemas/ListMeta'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  /api/v1/refunds/{id}:
+    get:
+      tags: [Refunds]
+      summary: Get a refund
+      description: |
+        Returns the refund details. The refund must belong to the authenticated merchant.
+        Returns 404 for both non-existent refund IDs and refunds belonging to another merchant.
+      operationId: getRefund
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RefundIdParam'
+      responses:
+        '200':
+          description: Refund found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refund'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  /api/v1/merchants/{merchantId}/api-keys:
+    post:
+      tags: [Webhooks]
+      summary: Create an API key
+      description: |
+        Creates a new named API key for the specified merchant. The plaintext secret is returned
+        **only on creation** — it cannot be retrieved again. Store it securely.
+
+        The authenticated merchant (X-API-Key) must match path `{merchantId}`.
+      operationId: createApiKey
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/MerchantIdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateApiKeyRequest'
+            examples:
+              default:
+                value:
+                  name: Production Key
+      responses:
+        '201':
+          description: API key created; secret returned once only
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateApiKeyResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+    get:
+      tags: [Webhooks]
+      summary: List API keys
+      description: Returns all API keys for the specified merchant. Never includes secret or secret_hash.
+      operationId: listApiKeys
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/MerchantIdParam'
+      responses:
+        '200':
+          description: API key list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ApiKey'
+                  meta:
+                    $ref: '#/components/schemas/Meta'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+  /api/v1/merchants/{merchantId}/api-keys/{keyId}:
+    delete:
+      tags: [Webhooks]
+      summary: Revoke an API key
+      description: |
+        Revokes an API key. The key immediately becomes unusable for authentication.
+        Revocation is permanent (soft delete — record preserved with status REVOKED).
+      operationId: revokeApiKey
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/MerchantIdParam'
+        - $ref: '#/components/parameters/ApiKeyIdParam'
+      responses:
+        '200':
+          description: Key revoked
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    type: object
+                    properties:
+                      message:
+                        type: string
+                        example: API key revoked
+                  meta:
+                    $ref: '#/components/schemas/Meta'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '409':
+          $ref: '#/components/responses/ConflictError'
+    post:
+      tags: [Webhooks]
+      summary: Rotate an API key
+      description: |
+        Atomically revokes the existing key and creates a replacement. The plaintext secret of
+        the new key is returned **only on rotation**. The old key is immediately revoked.
+      operationId: rotateApiKey
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/MerchantIdParam'
+        - $ref: '#/components/parameters/ApiKeyIdParam'
+      responses:
+        '201':
+          description: New key created; secret returned once only
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RotateApiKeyResponse'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '409':
+          $ref: '#/components/responses/ConflictError'
+  /api/v1/merchants/{merchantId}/webhook:
+    post:
+      tags: [Webhooks]
+      summary: Configure merchant webhook
+      description: |
+        Creates or replaces the merchant's outbound webhook endpoint. Returns the plaintext
+        signing secret **once**. Store it securely. One active endpoint per merchant.
+        Secret is AES-256-GCM encrypted at rest.
+      operationId: upsertWebhook
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/MerchantIdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpsertWebhookRequest'
+            examples:
+              default:
+                value:
+                  url: https://merchant.example.com/webhook
+                  description: Production webhook
+      responses:
+        '201':
+          description: Webhook configured; secret returned once
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookConfigWithSecret'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+    get:
+      tags: [Webhooks]
+      summary: Get webhook config
+      description: Returns the webhook configuration. Never includes the signing secret.
+      operationId: getWebhook
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/MerchantIdParam'
+      responses:
+        '200':
+          description: Webhook config
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookConfig'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+    delete:
+      tags: [Webhooks]
+      summary: Disable webhook
+      description: Soft-disables the webhook (ACTIVE → DISABLED). Historical deliveries remain.
+      operationId: disableWebhook
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/MerchantIdParam'
+      responses:
+        '200':
+          description: Webhook disabled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookConfig'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+  /api/v1/merchants/{merchantId}/webhook/rotate:
+    post:
+      tags: [Webhooks]
+      summary: Rotate webhook signing secret
+      description: Generates a new signing secret. Old secret stops being used immediately.
+      operationId: rotateWebhookSecret
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/MerchantIdParam'
+      responses:
+        '200':
+          description: Secret rotated; new secret returned once
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookConfigWithSecret'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+  /api/v1/merchants/{merchantId}/webhook/deliveries:
+    get:
+      tags: [Webhooks]
+      summary: List webhook deliveries
+      description: Lists outbound webhook delivery attempts for the merchant (audit / outbox).
+      operationId: listDeliveries
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/MerchantIdParam'
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+      responses:
+        '200':
+          description: Delivery list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/WebhookDelivery'
+                  meta:
+                    $ref: '#/components/schemas/ListMeta'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+  /api/v1/merchants/{merchantId}/webhook/deliveries/{deliveryId}/retry:
+    post:
+      tags: [Webhooks]
+      summary: Retry a webhook delivery
+      description: Re-queues FAILED, DEAD, or PENDING deliveries for immediate attempt.
+      operationId: retryDelivery
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/MerchantIdParam'
+        - $ref: '#/components/parameters/DeliveryIdParam'
+      responses:
+        '200':
+          description: Delivery queued for retry
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookDelivery'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '409':
+          $ref: '#/components/responses/ConflictError'
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: |
+        Merchant API key. Compound format: `pk_<hex>:sk_<hex>`.
+        The API key determines the merchant identity — never send a merchant_id.
+  parameters:
+    IdempotencyKeyHeader:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Merchant-scoped idempotency key (1–255 chars). Required for POST /payments and POST /refunds.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 255
+    PaymentIdParam:
+      name: id
+      in: path
+      required: true
+      description: Transaction UUID
+      schema:
+        type: string
+        format: uuid
+    RefundIdParam:
+      name: id
+      in: path
+      required: true
+      description: Refund UUID
+      schema:
+        type: string
+        format: uuid
+    MerchantIdParam:
+      name: merchantId
+      in: path
+      required: true
+      description: Merchant UUID
+      schema:
+        type: string
+        format: uuid
+    ApiKeyIdParam:
+      name: keyId
+      in: path
+      required: true
+      description: API key UUID
+      schema:
+        type: string
+        format: uuid
+    DeliveryIdParam:
+      name: deliveryId
+      in: path
+      required: true
+      description: Delivery UUID
+      schema:
+        type: string
+        format: uuid
+    PageParam:
+      name: page
+      in: query
+      required: false
+      description: Page number (default 1, min 1)
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+    LimitParam:
+      name: limit
+      in: query
+      required: false
+      description: Items per page (default 20, min 1, max 100)
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+    StatusFilter:
+      name: status
+      in: query
+      required: false
+      description: Filter by payment status
+      schema:
+        type: string
+        enum: [CREATED, PENDING, PAID, FAILED, EXPIRED, CANCELLED]
+    RefundStatusFilter:
+      name: status
+      in: query
+      required: false
+      description: Filter by refund status
+      schema:
+        type: string
+        enum: [PENDING, PROCESSING, SUCCEEDED, FAILED]
+    MerchantOrderIdFilter:
+      name: merchant_order_id
+      in: query
+      required: false
+      description: Filter by exact merchant_order_id
+      schema:
+        type: string
+    PaymentMethodFilter:
+      name: payment_method
+      in: query
+      required: false
+      description: Filter by payment method
+      schema:
+        type: string
+        enum: [QRIS]
+    CreatedFromParam:
+      name: created_from
+      in: query
+      required: false
+      description: Lower bound on created_at, RFC3339 (inclusive)
+      schema:
+        type: string
+        format: date-time
+    CreatedToParam:
+      name: created_to
+      in: query
+      required: false
+      description: Upper bound on created_at, RFC3339 (exclusive)
+      schema:
+        type: string
+        format: date-time
+  schemas:
+    CreatePaymentRequest:
+      type: object
+      required: [merchant_order_id, amount, currency, payment_method]
+      properties:
+        merchant_order_id:
+          type: string
+          minLength: 1
+          maxLength: 100
+          description: Merchant's unique order identifier
+        amount:
+          type: integer
+          format: int64
+          minimum: 1
+          description: "Amount in smallest currency unit (IDR: rupiah)"
+        currency:
+          type: string
+          enum: [IDR]
+          description: Currency code (ISO 4217)
+        payment_method:
+          type: string
+          enum: [QRIS]
+          description: Payment method
+    CreatePaymentResponse:
+      type: object
+      properties:
+        transaction_id:
+          type: string
+          format: uuid
+        merchant_order_id:
+          type: string
+        amount:
+          type: integer
+          format: int64
+        currency:
+          type: string
+        payment_method:
+          type: string
+        provider:
+          type: string
+          description: Payment provider name
+        provider_transaction_id:
+          type: string
+        status:
+          $ref: '#/components/schemas/PaymentStatus'
+        payment_url:
+          type: string
+          format: uri
+          description: URL to redirect customer for payment
+        expired_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+    Payment:
+      type: object
+      properties:
+        transaction_id:
+          type: string
+          format: uuid
+        merchant_order_id:
+          type: string
+        amount:
+          type: integer
+          format: int64
+        currency:
+          type: string
+        payment_method:
+          type: string
+        provider:
+          type: string
+          nullable: true
+        provider_transaction_id:
+          type: string
+          nullable: true
+        payment_url:
+          type: string
+          nullable: true
+        status:
+          $ref: '#/components/schemas/PaymentStatus'
+        expired_at:
+          type: string
+          format: date-time
+          nullable: true
+        paid_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    PaymentStatus:
+      type: string
+      enum: [CREATED, PENDING, PAID, FAILED, EXPIRED, CANCELLED]
+      description: |
+        Payment lifecycle status.
+
+        - CREATED: Transaction persisted, provider not yet called
+        - PENDING: Provider accepted, awaiting customer payment
+        - PAID: Customer payment confirmed (terminal)
+        - FAILED: Payment failed (terminal)
+        - EXPIRED: Payment expired (terminal)
+        - CANCELLED: Payment cancelled (terminal)
+    CreateRefundRequest:
+      type: object
+      required: [amount, currency]
+      properties:
+        amount:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Refund amount in smallest currency unit
+        currency:
+          type: string
+          enum: [IDR]
+        reason:
+          type: string
+          maxLength: 500
+          nullable: true
+    Refund:
+      type: object
+      properties:
+        refund_id:
+          type: string
+          format: uuid
+        transaction_id:
+          type: string
+          format: uuid
+        amount:
+          type: integer
+          format: int64
+        currency:
+          type: string
+        status:
+          $ref: '#/components/schemas/RefundStatus'
+        provider:
+          type: string
+        provider_refund_id:
+          type: string
+          nullable: true
+        reason:
+          type: string
+          nullable: true
+        refunded_amount:
+          type: integer
+          format: int64
+        reserved_amount:
+          type: integer
+          format: int64
+        refundable_amount:
+          type: integer
+          format: int64
+        transaction_amount:
+          type: integer
+          format: int64
+        requested_at:
+          type: string
+          format: date-time
+        succeeded_at:
+          type: string
+          format: date-time
+          nullable: true
+        failed_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    RefundStatus:
+      type: string
+      enum: [PENDING, PROCESSING, SUCCEEDED, FAILED]
+      description: |
+        Refund lifecycle status.
+
+        - PENDING: Refund created, provider not yet called
+        - PROCESSING: Provider processing
+        - SUCCEEDED: Refund completed (terminal)
+        - FAILED: Refund failed (terminal)
+    CreateApiKeyRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Optional expiration timestamp (must be in the future)
+    CreateApiKeyResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        merchant_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        key_id:
+          type: string
+          description: Public key identifier (pk_...)
+        secret:
+          type: string
+          description: Plaintext secret (sk_...) — returned ONCE only
+        status:
+          type: string
+          enum: [ACTIVE, REVOKED]
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+    RotateApiKeyResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        merchant_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        key_id:
+          type: string
+        secret:
+          type: string
+          description: New plaintext secret — returned ONCE only
+        status:
+          type: string
+          enum: [ACTIVE, REVOKED]
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+    ApiKey:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        merchant_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        key_id:
+          type: string
+        status:
+          type: string
+          enum: [ACTIVE, REVOKED]
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+        revoked_at:
+          type: string
+          format: date-time
+          nullable: true
+        last_used_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    UpsertWebhookRequest:
+      type: object
+      required: [url]
+      properties:
+        url:
+          type: string
+          format: uri
+          maxLength: 2048
+          description: Webhook endpoint URL (HTTPS required in production)
+        description:
+          type: string
+          maxLength: 100
+          nullable: true
+    WebhookConfig:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        merchant_id:
+          type: string
+          format: uuid
+        url:
+          type: string
+        status:
+          type: string
+          enum: [ACTIVE, DISABLED]
+        description:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    WebhookConfigWithSecret:
+      allOf:
+        - $ref: '#/components/schemas/WebhookConfig'
+        - type: object
+          properties:
+            secret:
+              type: string
+              description: Plaintext signing secret — returned ONCE only
+    WebhookDelivery:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        merchant_id:
+          type: string
+          format: uuid
+        event_id:
+          type: string
+        event_type:
+          type: string
+        transaction_id:
+          type: string
+          format: uuid
+        endpoint_url:
+          type: string
+        attempt_count:
+          type: integer
+        status:
+          type: string
+          enum: [PENDING, PROCESSING, DELIVERED, FAILED, DEAD]
+        next_attempt_at:
+          type: string
+          format: date-time
+        last_attempt_at:
+          type: string
+          format: date-time
+          nullable: true
+        delivered_at:
+          type: string
+          format: date-time
+          nullable: true
+        last_http_status:
+          type: integer
+          nullable: true
+        last_error:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    WebhookEventPayload:
+      type: object
+      description: Webhook event payload sent to merchant endpoint
+      properties:
+        id:
+          type: string
+          description: Event ID (evt_...)
+        type:
+          type: string
+          enum:
+            - payment.created
+            - payment.pending
+            - payment.paid
+            - payment.failed
+            - payment.expired
+            - payment.cancelled
+            - refund.created
+            - refund.processing
+            - refund.succeeded
+            - refund.failed
+        version:
+          type: string
+          example: "1"
+        created_at:
+          type: string
+          format: date-time
+        data:
+          $ref: '#/components/schemas/WebhookPaymentData'
+    WebhookPaymentData:
+      type: object
+      properties:
+        transaction_id:
+          type: string
+          format: uuid
+        merchant_order_id:
+          type: string
+        amount:
+          type: integer
+          format: int64
+        currency:
+          type: string
+        payment_method:
+          type: string
+        status:
+          $ref: '#/components/schemas/PaymentStatus'
+        payment_url:
+          type: string
+          nullable: true
+        provider_transaction_id:
+          type: string
+          nullable: true
+        expired_at:
+          type: string
+          format: date-time
+          nullable: true
+        paid_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    Error:
+      type: object
+      properties:
+        code:
+          type: string
+          description: Machine-readable error code
+        message:
+          type: string
+          description: Human-readable error message
+        details:
+          type: object
+          nullable: true
+          description: Field-level validation errors
+    ErrorResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+          example: false
+        error:
+          $ref: '#/components/schemas/Error'
+        meta:
+          $ref: '#/components/schemas/Meta'
+    Meta:
+      type: object
+      properties:
+        request_id:
+          type: string
+    ListMeta:
+      allOf:
+        - $ref: '#/components/schemas/Meta'
+        - type: object
+          properties:
+            page:
+              type: integer
+            limit:
+              type: integer
+            total:
+              type: integer
+              format: int64
+            total_pages:
+              type: integer
+  responses:
+    PaymentCreatedResponse:
+      description: Payment created (or replayed)
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              success:
+                type: boolean
+              data:
+                $ref: '#/components/schemas/CreatePaymentResponse'
+              meta:
+                $ref: '#/components/schemas/Meta'
+    PaymentListResponse:
+      description: Paginated payment list
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              success:
+                type: boolean
+              data:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Payment'
+              meta:
+                $ref: '#/components/schemas/ListMeta'
+    RefundCreatedResponse:
+      description: Refund created (or replayed)
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              success:
+                type: boolean
+              data:
+                $ref: '#/components/schemas/Refund'
+              meta:
+                $ref: '#/components/schemas/Meta'
+    UnauthorizedError:
+      description: Authentication failed
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            invalidKey:
+              value:
+                success: false
+                error:
+                  code: INVALID_API_KEY
+                  message: Invalid API key
+                meta:
+                  request_id: req_xxx
+            merchantInactive:
+              value:
+                success: false
+                error:
+                  code: MERCHANT_INACTIVE
+                  message: Merchant account is not active
+                meta:
+                  request_id: req_xxx
+    ForbiddenError:
+      description: Cross-merchant access denied
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            wrongMerchant:
+              value:
+                success: false
+                error:
+                  code: FORBIDDEN
+                  message: You do not have access to this merchant's resources
+                meta:
+                  request_id: req_xxx
+    NotFoundError:
+      description: Resource not found or belongs to another merchant
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            transactionNotFound:
+              value:
+                success: false
+                error:
+                  code: TRANSACTION_NOT_FOUND
+                  message: Transaction not found
+                meta:
+                  request_id: req_xxx
+    ValidationError:
+      description: Validation failed
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            invalidAmount:
+              value:
+                success: false
+                error:
+                  code: VALIDATION_ERROR
+                  message: Validation failed
+                  details:
+                    amount: Amount must be positive
+                meta:
+                  request_id: req_xxx
+    ConflictError:
+      description: Conflict with current resource state
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            duplicateOrder:
+              value:
+                success: false
+                error:
+                  code: DUPLICATE_ORDER
+                  message: An order with this merchant_order_id already exists
+                meta:
+                  request_id: req_xxx
+            idempotencyReused:
+              value:
+                success: false
+                error:
+                  code: IDEMPOTENCY_KEY_REUSED
+                  message: Idempotency-Key was already used with a different request
+                meta:
+                  request_id: req_xxx
+            idempotencyInProgress:
+              value:
+                success: false
+                error:
+                  code: IDEMPOTENCY_REQUEST_IN_PROGRESS
+                  message: A request with this Idempotency-Key is already in progress
+                meta:
+                  request_id: req_xxx
+    InternalServerError:
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            default:
+              value:
+                success: false
+                error:
+                  code: INTERNAL_ERROR
+                  message: An unexpected error occurred
+                meta:
+                  request_id: req_xxx
