@@ -47,6 +47,64 @@ Signing secrets are stored **encrypted at rest** (AES-256-GCM) using
 
 They are **not** hashed like API keys — the gateway must recover plaintext to sign outbound requests.
 
+## Where does the webhook URL come from?
+
+The webhook URL is **provided by the merchant**.
+
+GO-SAAS does not generate the merchant's webhook URL. The merchant's backend must expose an HTTP endpoint that is reachable by the GO-SAAS gateway.
+
+For example, if the merchant backend is:
+
+```text
+https://api.example-merchant.com
+```
+
+the merchant may expose:
+
+```http
+POST https://api.example-merchant.com/webhooks/payment
+```
+
+The merchant then registers that URL using the GO-SAAS webhook configuration endpoint:
+
+```http
+POST /api/v1/merchants/:id/webhook
+```
+
+Example configuration:
+
+```json
+{
+  "url": "https://api.example-merchant.com/webhooks/payment"
+}
+```
+
+After the webhook is configured, GO-SAAS will send payment events to that URL:
+
+```text
+GO-SAAS
+   │
+   │ HTTP POST + HMAC-SHA256
+   ▼
+https://api.example-merchant.com/webhooks/payment
+```
+
+### Local development
+
+If the merchant application is running locally and GO-SAAS can reach the same machine/network, the endpoint may use a local URL when allowed by the environment configuration.
+
+For example:
+
+```text
+http://localhost:3000/webhooks/payment
+```
+
+If GO-SAAS is running on a different machine or environment, `localhost` refers to the GO-SAAS environment itself and will not reach the developer's machine. In that case, the merchant must expose the local webhook endpoint through a reachable development URL, such as a tunnel or other publicly accessible development endpoint.
+
+The URL must satisfy the gateway's webhook URL policy. In production, HTTPS is required when `WEBHOOK_REQUIRE_HTTPS=true`.
+
+The merchant is responsible for implementing the endpoint, while GO-SAAS is responsible for delivering webhook events to the configured URL.
+
 ## Event types
 
 Mapped 1:1 from transaction statuses:
