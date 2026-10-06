@@ -202,6 +202,14 @@ func (s *stubMerchantService) UpdateMerchantStatus(_ context.Context, _ uuid.UUI
 	return s.resp, nil
 }
 
+type stubWebhookService struct {
+	processErr error
+}
+
+func (s *stubWebhookService) ProcessWebhook(_ context.Context, _ string, _ []byte, _ string) (*service.WebhookProcessResult, error) {
+	return nil, s.processErr
+}
+
 type stubReconService struct {
 	listResult *service.ListReconResultsResult
 	getResult  *model.ReconciliationResult
@@ -281,7 +289,8 @@ func newDashPhase9Router(role model.DashboardUserRole) *dashPhase9Deps {
 	r.Use(middleware.RequestID())
 
 	overviewH := handler.NewDashboardOverviewHandler(overviewSvc)
-	paymentH := handler.NewDashboardPaymentHandler(paymentSvc, refundSvc)
+	webhookSvc := &stubWebhookService{}
+	paymentH := handler.NewDashboardPaymentHandler(paymentSvc, refundSvc, webhookSvc, "test-secret")
 	refundH := handler.NewDashboardRefundHandler(refundSvc)
 	apiKeyH := handler.NewDashboardAPIKeyHandler(apiKeySvc)
 	settingsH := handler.NewDashboardSettingsHandler(merchantSvc)

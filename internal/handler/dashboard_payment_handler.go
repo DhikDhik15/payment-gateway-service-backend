@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -20,11 +21,13 @@ import (
 type DashboardPaymentHandler struct {
 	paymentSvc service.PaymentService
 	refundSvc  service.RefundService
+	webhookSvc service.WebhookService
+	mockSecret string
 }
 
 // NewDashboardPaymentHandler constructs a DashboardPaymentHandler.
-func NewDashboardPaymentHandler(paymentSvc service.PaymentService, refundSvc service.RefundService) *DashboardPaymentHandler {
-	return &DashboardPaymentHandler{paymentSvc: paymentSvc, refundSvc: refundSvc}
+func NewDashboardPaymentHandler(paymentSvc service.PaymentService, refundSvc service.RefundService, webhookSvc service.WebhookService, mockSecret string) *DashboardPaymentHandler {
+	return &DashboardPaymentHandler{paymentSvc: paymentSvc, refundSvc: refundSvc, webhookSvc: webhookSvc, mockSecret: mockSecret}
 }
 
 // ListPayments godoc
@@ -218,6 +221,127 @@ func (h *DashboardPaymentHandler) CreatePayment(c *gin.Context) {
 		return
 	}
 	response.Created(c, resp)
+}
+
+// SimulateSuccess godoc
+//
+//	@Summary		Simulate payment success
+//	@Description	Triggers a payment success transition through the mock provider webhook process.
+//	@Description	Scoped to the authenticated merchant (Bearer JWT); other tenants' payments are reported as 404.
+//	@Description	Reuses the existing webhook processing logic for state transitions and outbox.
+//	@Tags			Dashboard Payments
+//	@Produce		json
+//	@Security		BearerAuth
+//	@Param			payment_id	path		string	true	"Payment ID"
+//	@Success		200			{object}	response.successEnvelope{data=map[string]string}
+//	@Failure		400			{object}	response.errorEnvelope
+//	@Failure		401			{object}	response.errorEnvelope
+//	@Failure		404			{object}	response.errorEnvelope
+//	@Failure		500			{object}	response.errorEnvelope
+//	@Router			/api/v1/dashboard/payments/{payment_id}/simulate/success [post]
+func (h *DashboardPaymentHandler) SimulateSuccess(c *gin.Context) {
+	h.simulateStatusTransition(c, model.WebhookEventTypePaymentPaid, "PAID")
+}
+
+// SimulateFailure godoc
+//
+//	@Summary		Simulate payment failure
+//	@Description	Triggers a payment failure transition through the mock provider webhook process.
+//	@Description	Scoped to the authenticated merchant (Bearer JWT); other tenants' payments are reported as 404.
+//	@Description	Reuses the existing webhook processing logic for state transitions and outbox.
+//	@Tags			Dashboard Payments
+//	@Produce		json
+//	@Security		BearerAuth
+//	@Param			payment_id	path		string	true	"Payment ID"
+//	@Success		200			{object}	response.successEnvelope{data=map[string]string}
+//	@Failure		400			{object}	response.errorEnvelope
+//	@Failure		401			{object}	response.errorEnvelope
+//	@Failure		404			{object}	response.errorEnvelope
+//	@Failure		500			{object}	response.errorEnvelope
+//	@Router			/api/v1/dashboard/payments/{payment_id}/simulate/fail [post]
+func (h *DashboardPaymentHandler) SimulateFailure(c *gin.Context) {
+	h.simulateStatusTransition(c, model.WebhookEventTypePaymentFailed, "FAILED")
+}
+
+// simulateStatusTransition constructs a synthetic mock webhook payload and feeds it
+// through the existing WebhookService.ProcessWebhook path. This ensures the same
+// state machine validation, optimistic locking, and outbox enqueue behavior as
+// the merchant API-key simulator endpoints.
+func (h *DashboardPaymentHandler) simulateStatusTransition(c *gin.Context, eventType model.WebhookEventType, status string) {
+	caller := dashboardUserFromContext(c)
+	if caller == nil {
+		response.Unauthorized(c, response.CodeInvalidCredentials, "Authentication required")
+		return
+	}
+
+	paymentID, err := uuid.Parse(c.Param("payment_id"))
+	if err != nil {
+		response.BadRequest(c, response.CodeInvalidRequest, "Invalid payment ID format")
+		return
+	}
+
+	// Tenant-scoped read: the service adds a merchant_id predicate, so another
+	// merchant's payment is indistinguishable from a missing one (404).
+	p, err := h.paymentSvc.GetPayment(c.Request.Context(), caller.MerchantID, paymentID)
+	if err != nil {
+		if errors.Is(err, repository.ErrTransactionNotFound) {
+			response.NotFound(c, response.CodeTransactionNotFound, "Payment not found")
+			return
+		}
+		slog.Error("dashboard simulation: failed to get payment for transition",
+			slog.String("request_id", c.GetString(response.ContextKey)),
+			slog.String("error", err.Error()),
+		)
+		response.InternalServerError(c)
+		return
+	}
+
+	if p.Status.IsTerminal() {
+		response.BadRequest(c, response.CodeInvalidTransactionState, fmt.Sprintf("Payment is already in a terminal state: %s", p.Status))
+		return
+	}
+
+	providerTxID := ""
+	if p.ProviderTransactionID != nil {
+		providerTxID = *p.ProviderTransactionID
+	}
+
+	// Construct mock webhook payload
+	payload := map[string]any{
+		"event_id":                "evt_sim_" + uuid.New().String(),
+		"event_type":              string(eventType),
+		"provider_transaction_id": providerTxID,
+		"merchant_order_id":       p.MerchantOrderID,
+		"status":                  status,
+		"amount":                  p.Amount,
+		"currency":                p.Currency,
+	}
+
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		response.InternalServerError(c)
+		return
+	}
+
+	// Compute signature
+	signature := service.SignMockWebhookPayload(payloadBytes, h.mockSecret)
+
+	// Call WebhookService directly to execute standard transition and outbox logic.
+	_, err = h.webhookSvc.ProcessWebhook(c.Request.Context(), "MOCK", payloadBytes, signature)
+	if err != nil {
+		slog.Error("dashboard simulation: failed to process simulated webhook",
+			slog.String("request_id", c.GetString(response.ContextKey)),
+			slog.String("failure", "dashboard_simulation_webhook_transition_failed"),
+		)
+		if errors.Is(err, repository.ErrTransactionNotFound) {
+			response.NotFound(c, response.CodeTransactionNotFound, "Transaction not found for this event")
+			return
+		}
+		response.BadRequest(c, response.CodeInvalidRequest, "Simulation transition could not be processed")
+		return
+	}
+
+	response.OK(c, gin.H{"status": status})
 }
 
 // buildPaymentTimeline returns timeline events from real timestamps only.

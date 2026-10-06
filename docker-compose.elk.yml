@@ -1,0 +1,65 @@
+services:
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:9.1.4
+    container_name: pay-gate-elasticsearch
+    restart: unless-stopped
+
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - xpack.security.enrollment.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+
+    ports:
+      - "9200:9200"
+
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
+
+    networks:
+      - pay-gate-net
+
+  logstash:
+    image: docker.elastic.co/logstash/logstash:9.1.4
+    container_name: pay-gate-logstash
+    user: "0:0"
+    restart: unless-stopped
+
+    ports:
+      - "5000:5000"
+
+    volumes:
+      - ./elk/logstash/pipeline:/usr/share/logstash/pipeline:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+
+    depends_on:
+      - elasticsearch
+
+    networks:
+      - pay-gate-net
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:9.1.4
+    container_name: pay-gate-kibana
+    restart: unless-stopped
+
+    ports:
+      - "5601:5601"
+
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+
+    depends_on:
+      - elasticsearch
+
+    networks:
+      - pay-gate-net
+
+volumes:
+  elasticsearch-data:
+
+networks:
+  pay-gate-net:
+    external: true
+    name: pay-gate-network

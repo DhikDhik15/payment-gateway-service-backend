@@ -357,7 +357,7 @@ func main() {
 	invitationHandler := handler.NewInvitationHandler(invitationSvc)
 	// Phase 9: dashboard resource handlers (Bearer JWT only).
 	dashboardOverviewHandler := handler.NewDashboardOverviewHandler(dashboardOverviewSvc)
-	dashboardPaymentHandler := handler.NewDashboardPaymentHandler(paymentSvc, refundSvc)
+	dashboardPaymentHandler := handler.NewDashboardPaymentHandler(paymentSvc, refundSvc, webhookSvc, cfg.Webhook.MockSecret)
 	dashboardRefundHandler := handler.NewDashboardRefundHandler(refundSvc)
 	dashboardAPIKeyHandler := handler.NewDashboardAPIKeyHandler(apiKeySvc)
 	dashboardWebhookHandler := handler.NewDashboardWebhookHandler(merchantWebhookCfgSvc)
@@ -628,6 +628,17 @@ func main() {
 			dashboard.POST("/payments/:payment_id/refunds",
 				middleware.RequireRole(model.DashboardUserRoleOwner, model.DashboardUserRoleAdmin),
 				dashboardPaymentHandler.CreateRefund,
+			)
+
+			// Phase 5: payment simulation — JWT-authenticated simulation for dashboard users.
+			// Reuses the existing webhook processing logic for state transitions and outbox.
+			dashboard.POST("/payments/:payment_id/simulate/success",
+				middleware.RequireRole(model.DashboardUserRoleOwner, model.DashboardUserRoleAdmin),
+				dashboardPaymentHandler.SimulateSuccess,
+			)
+			dashboard.POST("/payments/:payment_id/simulate/fail",
+				middleware.RequireRole(model.DashboardUserRoleOwner, model.DashboardUserRoleAdmin),
+				dashboardPaymentHandler.SimulateFailure,
 			)
 
 			// Phase 9: API keys — read all roles; mutate OWNER/ADMIN.

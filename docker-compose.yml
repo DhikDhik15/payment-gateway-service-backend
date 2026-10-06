@@ -19,7 +19,7 @@ services:
     tmpfs:
       - /tmp
     ports:
-      - "127.0.0.1:8081:8080"
+      - "8081:8080"
     environment:
       APP_NAME: payment-gateway
       # Phase 8D.1: APP_ENV is overridable from the host .env and defaults to

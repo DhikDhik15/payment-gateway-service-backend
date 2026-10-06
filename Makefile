@@ -4,6 +4,7 @@
 
 .PHONY: all run build test test-integration fmt fmt-check vet \
         docker-up docker-down docker-build docker-logs docker-validate \
+        elk-up elk-down elk-provision elk-provision-dashboard elk-dashboard \
         migrate-up migrate-down migrate-status migrate-create \
         swagger lint clean help
 
@@ -23,6 +24,9 @@ TEST_DATABASE_URL ?=
 DB_URL        ?= $(if $(DATABASE_URL),$(DATABASE_URL),$(TEST_DATABASE_URL))
 # Docker Compose project name.
 COMPOSE_FILE  := docker-compose.yml
+# ELK stack compose file and Kibana URL.
+ELK_COMPOSE_FILE := docker-compose.elk.yml
+KIBANA_URL    ?= http://localhost:5601
 
 ## all: format check + vet + test + build (read-only for the source tree)
 all: fmt-check vet test build
@@ -95,6 +99,27 @@ docker-down:
 ## docker-logs: tail logs for all services
 docker-logs:
 	docker compose -f $(COMPOSE_FILE) logs -f
+
+# ── ELK observability ─────────────────────────────────────────────────────────
+
+## elk-up: start the ELK stack (Elasticsearch, Logstash, Kibana)
+elk-up:
+	docker compose -f $(ELK_COMPOSE_FILE) up -d
+
+## elk-provision: wait for Kibana readiness and provision Data View + Dashboard (idempotent)
+elk-provision:
+	KIBANA_URL=$(KIBANA_URL) ./elk/scripts/provision-kibana-dataview.sh
+	KIBANA_URL=$(KIBANA_URL) ./elk/scripts/provision-kibana-dashboard.sh
+
+## elk-provision-dashboard: provision only the dashboard (idempotent)
+elk-provision-dashboard:
+	KIBANA_URL=$(KIBANA_URL) ./elk/scripts/provision-kibana-dashboard.sh
+
+elk-dashboard: elk-provision-dashboard
+
+## elk-down: stop and remove the ELK stack
+elk-down:
+	docker compose -f $(ELK_COMPOSE_FILE) down
 
 # ── Database migrations ───────────────────────────────────────────────────────
 
