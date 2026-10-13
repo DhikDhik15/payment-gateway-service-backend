@@ -9,12 +9,18 @@ var (
 	ErrMerchantCodeExists     = errors.New("merchant code already exists")
 	ErrTransactionNotFound    = errors.New("transaction not found")
 	ErrDuplicateOrder         = errors.New("duplicate merchant order id")
+	ErrOrderPaymentConflict   = errors.New("order already has an active or paid payment")
 	ErrWebhookEventNotFound   = errors.New("webhook event not found")
 	ErrWebhookEventDuplicate  = errors.New("webhook event already exists")
 	ErrRefundNotFound         = errors.New("refund not found")
 	ErrRefundAmountExceeded   = errors.New("refund amount exceeds refundable balance")
 	ErrRefundNotAllowed       = errors.New("refund not allowed for transaction state")
 	ErrRefundCurrencyMismatch = errors.New("refund currency mismatch")
+
+	ErrCategoryNotFound   = errors.New("category not found")
+	ErrCategoryNameExists = errors.New("category name already exists")
+	ErrProductNotFound    = errors.New("product not found")
+	ErrProductSKUExists   = errors.New("product sku already exists")
 
 	ErrSettlementNotFound           = errors.New("settlement not found")
 	ErrSettlementAlreadyExists      = errors.New("settlement already exists")

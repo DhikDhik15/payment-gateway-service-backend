@@ -1,0 +1,14 @@
+# Ignore all generated certificate and private key material
+# The .gitignore itself should remain committed
+
+ca/
+elasticsearch/
+
+# Never commit private keys
+*.key
+
+# Never commit generated certificates
+*.crt
+
+# Allow specific non-sensitive files if any (none expected in this phase)
+!.gitignore

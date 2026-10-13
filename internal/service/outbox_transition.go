@@ -32,7 +32,7 @@ func (u *OutboxStatusUpdater) UpdateStatus(ctx context.Context, id uuid.UUID, fr
 			UPDATE transactions
 			SET status = $1, updated_at = NOW()
 			WHERE id = $2 AND status = $3
-			RETURNING id, merchant_id, merchant_order_id, amount, currency,
+			RETURNING id, merchant_id, order_id, merchant_order_id, amount, currency,
 			          payment_method, provider, provider_transaction_id, payment_url,
 			          status, expired_at, paid_at, refunded_amount, reserved_refund_amount,
 			          created_at, updated_at`
@@ -65,7 +65,7 @@ func (u *OutboxStatusUpdater) UpdateStatusWithProvider(
 			    expired_at = COALESCE($5, expired_at),
 			    updated_at = NOW()
 			WHERE id = $6 AND status = $7
-			RETURNING id, merchant_id, merchant_order_id, amount, currency,
+			RETURNING id, merchant_id, order_id, merchant_order_id, amount, currency,
 			          payment_method, provider, provider_transaction_id, payment_url,
 			          status, expired_at, paid_at, refunded_amount, reserved_refund_amount,
 			          created_at, updated_at`
@@ -80,6 +80,31 @@ func (u *OutboxStatusUpdater) UpdateStatusWithProvider(
 	})
 }
 
+// UpdateStatusWithPaidAt records a confirmed successful payment and its
+// merchant webhook event atomically.
+func (u *OutboxStatusUpdater) UpdateStatusWithPaidAt(ctx context.Context, id uuid.UUID, from model.TransactionStatus) error {
+	return u.withTx(ctx, func(dbTx pgx.Tx) (*model.Transaction, model.TransactionStatus, error) {
+		const q = `
+			UPDATE transactions
+			SET status = 'PAID',
+			    paid_at = COALESCE(paid_at, NOW()),
+			    updated_at = NOW()
+			WHERE id = $1 AND status = $2
+			RETURNING id, merchant_id, order_id, merchant_order_id, amount, currency,
+			          payment_method, provider, provider_transaction_id, payment_url,
+			          status, expired_at, paid_at, refunded_amount, reserved_refund_amount,
+			          created_at, updated_at`
+		transaction, err := scanTxRow(dbTx.QueryRow(ctx, q, id, from))
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil, "", repository.ErrTransactionNotFound
+			}
+			return nil, "", err
+		}
+		return transaction, model.TransactionStatusPaid, nil
+	})
+}
+
 // CreateCreated inserts a CREATED transaction and enqueues payment.created.
 func (u *OutboxStatusUpdater) CreateCreated(ctx context.Context, tx *model.Transaction) error {
 	dbTx, err := u.db.Begin(ctx)
@@ -90,15 +115,18 @@ func (u *OutboxStatusUpdater) CreateCreated(ctx context.Context, tx *model.Trans
 
 	const q = `
 		INSERT INTO transactions
-		    (id, merchant_id, merchant_order_id, amount, currency,
+		    (id, merchant_id, order_id, merchant_order_id, amount, currency,
 		     payment_method, provider, provider_transaction_id, payment_url,
 		     status, expired_at, paid_at, created_at, updated_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`
 	if _, err := dbTx.Exec(ctx, q,
-		tx.ID, tx.MerchantID, tx.MerchantOrderID, tx.Amount, tx.Currency,
+		tx.ID, tx.MerchantID, tx.OrderID, tx.MerchantOrderID, tx.Amount, tx.Currency,
 		tx.PaymentMethod, tx.Provider, tx.ProviderTransactionID, tx.PaymentURL,
 		tx.Status, tx.ExpiredAt, tx.PaidAt, tx.CreatedAt, tx.UpdatedAt,
 	); err != nil {
+		if repository.IsOrderPaymentConflict(err) {
+			return repository.ErrOrderPaymentConflict
+		}
 		return fmt.Errorf("outbox create transaction: %w", err)
 	}
 	if u.publisher != nil {
@@ -137,7 +165,7 @@ func (u *OutboxStatusUpdater) withTx(
 func scanTxRow(row pgx.Row) (*model.Transaction, error) {
 	tx := &model.Transaction{}
 	err := row.Scan(
-		&tx.ID, &tx.MerchantID, &tx.MerchantOrderID, &tx.Amount, &tx.Currency,
+		&tx.ID, &tx.MerchantID, &tx.OrderID, &tx.MerchantOrderID, &tx.Amount, &tx.Currency,
 		&tx.PaymentMethod, &tx.Provider, &tx.ProviderTransactionID, &tx.PaymentURL,
 		&tx.Status, &tx.ExpiredAt, &tx.PaidAt, &tx.RefundedAmount, &tx.ReservedRefundAmount,
 		&tx.CreatedAt, &tx.UpdatedAt,

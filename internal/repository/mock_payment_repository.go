@@ -19,6 +19,7 @@ var ErrMockPaymentExpired = errors.New("mock payment expired")
 type MockPaymentRepository interface {
 	Create(context.Context, *model.MockPayment) error
 	FindByPublicID(context.Context, string) (*model.MockPayment, error)
+	FindByGatewayTransactionID(context.Context, string) (*model.MockPayment, error)
 	Transition(context.Context, string, model.TransactionStatus) (*model.MockPayment, error)
 }
 
@@ -49,6 +50,14 @@ func (r *pgMockPaymentRepository) FindByPublicID(ctx context.Context, id string)
 	p, err := scanMockPayment(r.db.QueryRow(ctx, `SELECT `+mockPaymentCols+` FROM mock_payments WHERE public_id=$1`, id))
 	if err != nil && !errors.Is(err, ErrMockPaymentNotFound) {
 		return nil, fmt.Errorf("find mock payment: %w", err)
+	}
+	return p, err
+}
+
+func (r *pgMockPaymentRepository) FindByGatewayTransactionID(ctx context.Context, id string) (*model.MockPayment, error) {
+	p, err := scanMockPayment(r.db.QueryRow(ctx, `SELECT `+mockPaymentCols+` FROM mock_payments WHERE gateway_transaction_id=$1`, id))
+	if err != nil && !errors.Is(err, ErrMockPaymentNotFound) {
+		return nil, fmt.Errorf("find mock payment by gateway transaction: %w", err)
 	}
 	return p, err
 }

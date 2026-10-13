@@ -14,6 +14,10 @@ var ErrProviderFailure = errors.New("payment provider failure")
 // ErrProviderTimeout is returned when the provider does not respond in time.
 var ErrProviderTimeout = errors.New("payment provider timeout")
 
+// ErrProviderPaymentNotFound means a provider lookup definitively found no
+// payment for the gateway-generated reference.
+var ErrProviderPaymentNotFound = errors.New("provider payment not found")
+
 // ─── Provider request / response types ───────────────────────────────────────
 
 // ProviderCreateRequest carries the data sent to a payment provider when

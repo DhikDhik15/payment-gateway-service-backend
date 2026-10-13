@@ -23,6 +23,12 @@ func (s *mockPublicStore) FindByPublicID(_ context.Context, id string) (*model.M
 	}
 	return s.p, nil
 }
+func (s *mockPublicStore) FindByGatewayTransactionID(_ context.Context, id string) (*model.MockPayment, error) {
+	if s.p == nil || id != s.p.GatewayTransactionID {
+		return nil, repository.ErrMockPaymentNotFound
+	}
+	return s.p, nil
+}
 func (s *mockPublicStore) Transition(_ context.Context, id string, to model.TransactionStatus) (*model.MockPayment, error) {
 	if s.p == nil || id != s.p.PublicID {
 		return nil, repository.ErrMockPaymentNotFound

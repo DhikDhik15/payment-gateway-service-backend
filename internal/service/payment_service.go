@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/dhikaarta/pay-gate-backend/internal/model"
@@ -51,6 +52,12 @@ type PaymentService interface {
 	// Returns ErrTransactionNotFound (from repository) if not found or
 	// if the transaction belongs to a different merchant.
 	GetPayment(ctx context.Context, merchantID, transactionID uuid.UUID) (*model.PaymentResponse, error)
+
+	// GetPaymentDetail returns GetPayment enriched with the linked order's
+	// immutable item snapshots for the product breakdown. Items are omitted
+	// when the payment has no linked order or the items cannot be resolved;
+	// all other fields match GetPayment exactly.
+	GetPaymentDetail(ctx context.Context, merchantID, transactionID uuid.UUID) (*model.DashboardPaymentDetailResponse, error)
 
 	// CancelPayment cancels a CREATED or PENDING transaction.
 	// For PENDING transactions the provider is asked to cancel first.
@@ -135,14 +142,25 @@ func (s *paymentService) CreatePayment(ctx context.Context, merchantID uuid.UUID
 }
 
 func (s *paymentService) CreatePaymentWithIdempotency(ctx context.Context, merchantID uuid.UUID, req model.CreatePaymentRequest, key string) (*model.CreatePaymentResponse, error) {
-	if s.idempotency == nil {
+	return s.createWithIdempotency(ctx, merchantID, key, model.PaymentRequestHash(req), func() (*model.CreatePaymentResponse, error) {
 		return s.createPayment(ctx, merchantID, req)
+	})
+}
+
+func (s *paymentService) createWithIdempotency(
+	ctx context.Context,
+	merchantID uuid.UUID,
+	key, requestHash string,
+	create func() (*model.CreatePaymentResponse, error),
+) (*model.CreatePaymentResponse, error) {
+	if s.idempotency == nil {
+		return create()
 	}
 
 	now := time.Now().UTC()
 	record := &model.IdempotencyKey{
 		ID: uuid.New(), MerchantID: merchantID, Key: key,
-		RequestHash: model.PaymentRequestHash(req), Status: model.IdempotencyStatusProcessing,
+		RequestHash: requestHash, Status: model.IdempotencyStatusProcessing,
 		CreatedAt: now, UpdatedAt: now, ExpiresAt: now.Add(s.idempotencyTTL),
 	}
 	owner, err := s.idempotency.Reserve(ctx, record)
@@ -154,7 +172,7 @@ func (s *paymentService) CreatePaymentWithIdempotency(ctx context.Context, merch
 		if err != nil {
 			return nil, fmt.Errorf("load idempotency key after conflict: %w", err)
 		}
-		if record.RequestHash != model.PaymentRequestHash(req) {
+		if record.RequestHash != requestHash {
 			return nil, ErrIdempotencyKeyReused
 		}
 		switch record.Status {
@@ -173,7 +191,7 @@ func (s *paymentService) CreatePaymentWithIdempotency(ctx context.Context, merch
 		}
 	}
 
-	response, processErr := s.createPayment(ctx, merchantID, req)
+	response, processErr := create()
 	if processErr != nil {
 		status := http.StatusInternalServerError
 		if errors.Is(processErr, ErrProviderTimeout) {
@@ -201,6 +219,8 @@ func (s *paymentService) CreatePaymentWithIdempotency(ctx context.Context, merch
 
 func idempotencyErrorCode(err error) string {
 	switch {
+	case errors.Is(err, ErrOrderPaymentConflict):
+		return "ORDER_PAYMENT_CONFLICT"
 	case errors.Is(err, ErrProviderTimeout):
 		return "PAYMENT_PROVIDER_TIMEOUT"
 	case errors.Is(err, ErrProviderFailure):
@@ -218,6 +238,8 @@ func storedIdempotencyError(body []byte) error {
 		return fmt.Errorf("stored idempotency failure: %w", err)
 	}
 	switch stored.ErrorCode {
+	case "ORDER_PAYMENT_CONFLICT":
+		return ErrOrderPaymentConflict
 	case "PAYMENT_PROVIDER_TIMEOUT":
 		return ErrProviderTimeout
 	case "PAYMENT_PROVIDER_ERROR":
@@ -254,6 +276,7 @@ func (s *paymentService) createPayment(ctx context.Context, merchantID uuid.UUID
 	tx := &model.Transaction{
 		ID:              uuid.New(),
 		MerchantID:      merchantID,
+		OrderID:         req.OrderID,
 		MerchantOrderID: req.MerchantOrderID,
 		Amount:          req.Amount,
 		Currency:        req.Currency,
@@ -295,12 +318,36 @@ func (s *paymentService) createPayment(ctx context.Context, merchantID uuid.UUID
 	}
 
 	providerResp, providerErr := s.provider.CreatePayment(ctx, providerReq)
+	var reconciledStatus model.TransactionStatus
+	unresolvedProviderOutcome := false
+	if providerErr != nil && errors.Is(providerErr, ErrProviderTimeout) && req.OrderID != nil {
+		lookup, lookupErr := s.provider.GetPayment(ctx, tx.ID.String())
+		switch {
+		case lookupErr == nil:
+			providerResp = lookup
+			reconciledStatus, _ = normalizedProviderStatus(lookup.Status)
+			if reconciledStatus == "" {
+				unresolvedProviderOutcome = true
+			} else if reconciledStatus == model.TransactionStatusFailed {
+				providerErr = ErrProviderFailure
+			} else {
+				providerErr = nil
+			}
+		case errors.Is(lookupErr, ErrProviderPaymentNotFound):
+			providerErr = ErrProviderFailure
+		default:
+			unresolvedProviderOutcome = true
+		}
+	}
 
 	// ── 5. Persist payment attempt (always, regardless of provider result) ────
 
 	attemptStatus := "SUCCESS"
 	if providerErr != nil {
 		attemptStatus = "FAILED"
+	}
+	if unresolvedProviderOutcome {
+		attemptStatus = "UNKNOWN"
 	}
 
 	reqPayload, _ := json.Marshal(providerReq)
@@ -338,6 +385,12 @@ func (s *paymentService) createPayment(ctx context.Context, merchantID uuid.UUID
 			slog.String("error", err.Error()),
 		)
 	}
+	if unresolvedProviderOutcome {
+		// The provider may have accepted the request. Keep CREATED so the
+		// Order-level active-payment guard prevents a second charge until lookup
+		// can resolve the outcome.
+		return nil, ErrProviderTimeout
+	}
 
 	// ── 6. Handle provider failure ────────────────────────────────────────────
 
@@ -370,6 +423,15 @@ func (s *paymentService) createPayment(ctx context.Context, merchantID uuid.UUID
 		)
 		return nil, fmt.Errorf("payment service create: update status: %w", err)
 	}
+	if reconciledStatus == model.TransactionStatusPaid {
+		if err := s.transitionPaid(ctx, tx, model.TransactionStatusPending); err != nil {
+			return nil, fmt.Errorf("payment service reconcile paid: %w", err)
+		}
+	} else if reconciledStatus == model.TransactionStatusExpired || reconciledStatus == model.TransactionStatusCancelled {
+		if err := s.transitionFromPending(ctx, tx, reconciledStatus); err != nil {
+			return nil, fmt.Errorf("payment service reconcile terminal status: %w", err)
+		}
+	}
 
 	slog.Info("transaction moved to PENDING",
 		slog.String("transaction_id", tx.ID.String()),
@@ -379,13 +441,14 @@ func (s *paymentService) createPayment(ctx context.Context, merchantID uuid.UUID
 
 	return &model.CreatePaymentResponse{
 		TransactionID:         tx.ID,
+		OrderID:               tx.OrderID,
 		MerchantOrderID:       tx.MerchantOrderID,
 		Amount:                tx.Amount,
 		Currency:              tx.Currency,
 		PaymentMethod:         tx.PaymentMethod,
 		Provider:              s.provider.Name(),
 		ProviderTransactionID: providerResp.ProviderTransactionID,
-		Status:                model.TransactionStatusPending,
+		Status:                tx.Status,
 		PaymentURL:            providerResp.PaymentURL,
 		ExpiredAt:             providerResp.ExpiredAt,
 		CreatedAt:             tx.CreatedAt,
@@ -406,6 +469,92 @@ func (s *paymentService) transitionFailed(ctx context.Context, tx *model.Transac
 	tx.Status = model.TransactionStatusFailed
 	EnqueueForTransaction(ctx, s.publisher, tx, model.TransactionStatusFailed)
 	return nil
+}
+
+func (s *paymentService) transitionPaid(ctx context.Context, tx *model.Transaction, from model.TransactionStatus) error {
+	if s.outbox != nil {
+		if err := s.outbox.UpdateStatusWithPaidAt(ctx, tx.ID, from); err != nil {
+			return err
+		}
+	} else {
+		if err := s.txRepo.UpdateStatusWithPaidAt(ctx, tx.ID, from); err != nil {
+			return err
+		}
+		tx.Status = model.TransactionStatusPaid
+		now := time.Now().UTC()
+		tx.PaidAt = &now
+		EnqueueForTransaction(ctx, s.publisher, tx, model.TransactionStatusPaid)
+	}
+	tx.Status = model.TransactionStatusPaid
+	if tx.PaidAt == nil {
+		now := time.Now().UTC()
+		tx.PaidAt = &now
+	}
+	return nil
+}
+
+func (s *paymentService) transitionFromPending(ctx context.Context, tx *model.Transaction, to model.TransactionStatus) error {
+	if s.outbox != nil {
+		if err := s.outbox.UpdateStatus(ctx, tx.ID, model.TransactionStatusPending, to); err != nil {
+			return err
+		}
+	} else {
+		if err := s.txRepo.UpdateStatus(ctx, tx.ID, model.TransactionStatusPending, to); err != nil {
+			return err
+		}
+		tx.Status = to
+		EnqueueForTransaction(ctx, s.publisher, tx, to)
+	}
+	tx.Status = to
+	return nil
+}
+
+func normalizedProviderStatus(status string) (model.TransactionStatus, bool) {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "pending", "created", "authorize", "authorized":
+		return model.TransactionStatusPending, true
+	case "paid", "settlement", "capture", "success", "succeeded":
+		return model.TransactionStatusPaid, true
+	case "failed", "deny", "denied", "failure":
+		return model.TransactionStatusFailed, true
+	case "expired", "expire":
+		return model.TransactionStatusExpired, true
+	case "cancelled", "canceled", "cancel":
+		return model.TransactionStatusCancelled, true
+	default:
+		return "", false
+	}
+}
+
+// reconcileOrderAttempt is called only for an Order-backed CREATED row left
+// by an ambiguous provider timeout. A status lookup, never another create, is
+// used to determine whether a retry may safely proceed.
+func (s *paymentService) reconcileOrderAttempt(ctx context.Context, tx *model.Transaction) error {
+	providerResponse, err := s.provider.GetPayment(ctx, tx.ID.String())
+	if err != nil {
+		if errors.Is(err, ErrProviderPaymentNotFound) {
+			return s.transitionFailed(ctx, tx)
+		}
+		return ErrProviderTimeout
+	}
+	target, ok := normalizedProviderStatus(providerResponse.Status)
+	if !ok {
+		return ErrProviderTimeout
+	}
+	if target == model.TransactionStatusFailed {
+		return s.transitionFailed(ctx, tx)
+	}
+	if err := s.transitionPending(ctx, tx, providerResponse); err != nil {
+		return err
+	}
+	switch target {
+	case model.TransactionStatusPaid:
+		return s.transitionPaid(ctx, tx, model.TransactionStatusPending)
+	case model.TransactionStatusExpired, model.TransactionStatusCancelled:
+		return s.transitionFromPending(ctx, tx, target)
+	default:
+		return nil
+	}
 }
 
 func (s *paymentService) transitionPending(ctx context.Context, tx *model.Transaction, providerResp *ProviderPaymentResponse) error {
@@ -447,7 +596,40 @@ func (s *paymentService) GetPayment(ctx context.Context, merchantID, transaction
 		// "belongs to another merchant" — intentional (no info leakage).
 		return nil, err
 	}
-	return txToPaymentResponse(tx), nil
+	resp := txToPaymentResponse(tx)
+	if enriched, ok := s.orderSummaryFor(ctx, merchantID, tx.OrderID); ok {
+		resp.OrderSummary = enriched
+	}
+	return resp, nil
+}
+
+// GetPaymentDetail returns the merchant-scoped payment plus its immutable
+// order-item snapshots. The items query is merchant-scoped and single-shot
+// (no N+1); lookup failures are logged and omitted, never fatal, matching
+// the orderSummaryFor enrichment contract.
+func (s *paymentService) GetPaymentDetail(ctx context.Context, merchantID, transactionID uuid.UUID) (*model.DashboardPaymentDetailResponse, error) {
+	payment, err := s.GetPayment(ctx, merchantID, transactionID)
+	if err != nil {
+		return nil, err
+	}
+	detail := &model.DashboardPaymentDetailResponse{PaymentResponse: *payment}
+	if payment.OrderID == nil {
+		return detail, nil
+	}
+	items, ok := s.orderItemsFor(ctx, merchantID, *payment.OrderID)
+	if !ok {
+		return detail, nil
+	}
+	detail.OrderItems = make([]model.DashboardPaymentOrderItem, 0, len(items))
+	for _, item := range items {
+		detail.OrderItems = append(detail.OrderItems, model.DashboardPaymentOrderItem{
+			ProductName: item.ProductName,
+			UnitPrice:   item.UnitPrice,
+			Quantity:    item.Quantity,
+			Subtotal:    item.Subtotal,
+		})
+	}
+	return detail, nil
 }
 
 // ─── CancelPayment ────────────────────────────────────────────────────────────
@@ -604,6 +786,7 @@ func (s *paymentService) ListPayments(ctx context.Context, merchantID uuid.UUID,
 	for _, tx := range txs {
 		items = append(items, *txToPaymentResponse(tx))
 	}
+	s.attachOrderSummaries(ctx, merchantID, items)
 
 	// Compute total pages (ceil).
 	totalPages := 0
@@ -626,6 +809,7 @@ func (s *paymentService) ListPayments(ctx context.Context, merchantID uuid.UUID,
 func txToPaymentResponse(tx *model.Transaction) *model.PaymentResponse {
 	return &model.PaymentResponse{
 		TransactionID:         tx.ID,
+		OrderID:               tx.OrderID,
 		MerchantOrderID:       tx.MerchantOrderID,
 		Amount:                tx.Amount,
 		Currency:              tx.Currency,
@@ -639,6 +823,91 @@ func txToPaymentResponse(tx *model.Transaction) *model.PaymentResponse {
 		CreatedAt:             tx.CreatedAt,
 		UpdatedAt:             tx.UpdatedAt,
 	}
+}
+
+// attachOrderSummaries batch-loads product-name summaries for the order-linked
+// responses in a single query and attaches them in place (the slice shares
+// its backing array with the caller). Display enrichment must never break or
+// slow the payments list: repositories without OrderSummaryLookup support,
+// empty input, or lookup errors leave OrderSummary omitted and clients fall
+// back to merchant_order_id.
+func (s *paymentService) attachOrderSummaries(ctx context.Context, merchantID uuid.UUID, items []model.PaymentResponse) {
+	seen := make(map[uuid.UUID]struct{})
+	var orderIDs []uuid.UUID
+	for i := range items {
+		if items[i].OrderID == nil {
+			continue
+		}
+		if _, dup := seen[*items[i].OrderID]; dup {
+			continue
+		}
+		seen[*items[i].OrderID] = struct{}{}
+		orderIDs = append(orderIDs, *items[i].OrderID)
+	}
+	if len(orderIDs) == 0 {
+		return
+	}
+	lookup, ok := s.txRepo.(repository.OrderSummaryLookup)
+	if !ok {
+		return
+	}
+	summaries, err := lookup.GetOrderSummaries(ctx, merchantID, orderIDs)
+	if err != nil {
+		slog.Warn("payment service: order summaries unavailable, omitting",
+			slog.String("error", err.Error()),
+		)
+		return
+	}
+	for i := range items {
+		if items[i].OrderID == nil {
+			continue
+		}
+		if summary, ok := summaries[*items[i].OrderID]; ok {
+			items[i].OrderSummary = summary
+		}
+	}
+}
+
+// orderSummaryFor resolves the product-name summary for a single order-linked
+// transaction, reporting whether one was found.
+func (s *paymentService) orderSummaryFor(ctx context.Context, merchantID uuid.UUID, orderID *uuid.UUID) (*model.OrderSummary, bool) {
+	if orderID == nil {
+		return nil, false
+	}
+	lookup, ok := s.txRepo.(repository.OrderSummaryLookup)
+	if !ok {
+		return nil, false
+	}
+	summaries, err := lookup.GetOrderSummaries(ctx, merchantID, []uuid.UUID{*orderID})
+	if err != nil {
+		slog.Warn("payment service: order summary unavailable, omitting",
+			slog.String("error", err.Error()),
+		)
+		return nil, false
+	}
+	summary, ok := summaries[*orderID]
+	return summary, ok
+}
+
+// orderItemsFor resolves the immutable order-item snapshots for a single
+// order-linked transaction, reporting whether any were found. An empty item
+// set and lookup errors both yield false so callers omit the breakdown.
+func (s *paymentService) orderItemsFor(ctx context.Context, merchantID, orderID uuid.UUID) ([]model.OrderItem, bool) {
+	lookup, ok := s.txRepo.(repository.OrderItemsLookup)
+	if !ok {
+		return nil, false
+	}
+	items, err := lookup.GetOrderItems(ctx, merchantID, orderID)
+	if err != nil {
+		slog.Warn("payment service: order items unavailable, omitting",
+			slog.String("error", err.Error()),
+		)
+		return nil, false
+	}
+	if len(items) == 0 {
+		return nil, false
+	}
+	return items, true
 }
 
 // resolveProviderTxID returns the ProviderTransactionID from the most recent

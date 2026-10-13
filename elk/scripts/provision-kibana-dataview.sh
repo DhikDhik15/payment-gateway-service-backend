@@ -7,6 +7,14 @@
 set -euo pipefail
 
 KIBANA_URL="${KIBANA_URL:-http://localhost:5601}"
+# Optional Kibana Basic auth (required when Elasticsearch security is enabled,
+# which turns on Kibana authentication). Empty = anonymous (legacy dev mode).
+KIBANA_USER="${KIBANA_USER:-}"
+KIBANA_PASSWORD="${KIBANA_PASSWORD:-}"
+CURL_AUTH=()
+if [[ -n "${KIBANA_USER}" ]]; then
+  CURL_AUTH=(-u "${KIBANA_USER}:${KIBANA_PASSWORD}")
+fi
 DATA_VIEW_ID="${DATA_VIEW_ID:-go-saas-payment-gateway-logs}"
 DATA_VIEW_NAME="${DATA_VIEW_NAME:-GO-SAAS Payment Gateway Logs}"
 DATA_VIEW_TITLE="${DATA_VIEW_TITLE:-payment-gateway-logs-*}"
@@ -37,6 +45,7 @@ echo "[provision] Kibana is available."
 
 # ── Check whether the Data View already exists ──────────────────────────────
 http_code="$(curl -s -o /tmp/kibana-dv-get.json -w '%{http_code}' \
+  "${CURL_AUTH[@]}" \
   -H 'kbn-xsrf: true' \
   "${KIBANA_URL}/api/saved_objects/index-pattern/${DATA_VIEW_ID}")"
 
@@ -49,6 +58,7 @@ if [ "${http_code}" = "200" ]; then
   fi
   echo "[provision] Data View exists but differs (title='${existing_title}', timeFieldName='${existing_ts}'). Updating..."
   update_code="$(curl -s -o /tmp/kibana-dv-update.json -w '%{http_code}' -X PUT \
+    "${CURL_AUTH[@]}" \
     -H 'kbn-xsrf: true' -H 'Content-Type: application/json' \
     "${KIBANA_URL}/api/saved_objects/index-pattern/${DATA_VIEW_ID}" \
     -d "{\"attributes\":{\"title\":\"${DATA_VIEW_TITLE}\",\"timeFieldName\":\"${TIME_FIELD}\",\"name\":\"${DATA_VIEW_NAME}\"}}")"
@@ -64,6 +74,7 @@ fi
 # ── Create the Data View ────────────────────────────────────────────────────
 echo "[provision] Creating Data View '${DATA_VIEW_NAME}'..."
 create_code="$(curl -s -o /tmp/kibana-dv-create.json -w '%{http_code}' -X POST \
+  "${CURL_AUTH[@]}" \
   -H 'kbn-xsrf: true' -H 'Content-Type: application/json' \
   "${KIBANA_URL}/api/saved_objects/index-pattern/${DATA_VIEW_ID}" \
   -d "{\"attributes\":{\"title\":\"${DATA_VIEW_TITLE}\",\"timeFieldName\":\"${TIME_FIELD}\",\"name\":\"${DATA_VIEW_NAME}\"}}")"

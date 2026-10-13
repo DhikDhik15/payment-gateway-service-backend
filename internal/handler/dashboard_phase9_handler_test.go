@@ -49,6 +49,7 @@ type stubPaymentService struct {
 	listErr      error
 	getResp      *model.PaymentResponse
 	getErr       error
+	detailItems  []model.DashboardPaymentOrderItem
 	createResp   *model.CreatePaymentResponse
 	createErr    error
 	lastMerchant uuid.UUID
@@ -78,6 +79,13 @@ func (s *stubPaymentService) GetPayment(_ context.Context, merchantID, txID uuid
 		return nil, s.getErr
 	}
 	return s.getResp, nil
+}
+func (s *stubPaymentService) GetPaymentDetail(ctx context.Context, merchantID, txID uuid.UUID) (*model.DashboardPaymentDetailResponse, error) {
+	payment, err := s.GetPayment(ctx, merchantID, txID)
+	if err != nil {
+		return nil, err
+	}
+	return &model.DashboardPaymentDetailResponse{PaymentResponse: *payment, OrderItems: s.detailItems}, nil
 }
 func (s *stubPaymentService) ListPayments(_ context.Context, merchantID uuid.UUID, filter model.TransactionListFilter) (*model.ListPaymentsResult, error) {
 	s.lastMerchant = merchantID
@@ -571,6 +579,91 @@ func TestDashboardPhase9_PaymentDetail_Timeline(t *testing.T) {
 	}
 	if env.Data.Timeline[0].Type != "CREATED" || env.Data.Timeline[1].Type != "PAID" {
 		t.Fatalf("unexpected timeline: %+v", env.Data.Timeline)
+	}
+}
+
+func TestDashboardPhase9_PaymentDetail_OrderItems(t *testing.T) {
+	deps := newDashPhase9Router(model.DashboardUserRoleOwner)
+	txID := uuid.New()
+	created := time.Now().UTC()
+	deps.paymentSvc.getResp = &model.PaymentResponse{
+		TransactionID:   txID,
+		MerchantOrderID: "ord-items",
+		Amount:          90000,
+		Currency:        "IDR",
+		Status:          model.TransactionStatusPaid,
+		CreatedAt:       created,
+		UpdatedAt:       created,
+	}
+	deps.paymentSvc.detailItems = []model.DashboardPaymentOrderItem{
+		{ProductName: "Kopi Arabika", UnitPrice: 35000, Quantity: 2, Subtotal: 70000},
+		{ProductName: "Teh Hijau", UnitPrice: 20000, Quantity: 1, Subtotal: 20000},
+	}
+
+	w := dashDo(deps.router, http.MethodGet, "/api/v1/dashboard/payments/"+txID.String(), nil, "token")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	var env struct {
+		Data struct {
+			Amount     int64  `json:"amount"`
+			Status     string `json:"status"`
+			OrderItems []struct {
+				ProductName string `json:"product_name"`
+				UnitPrice   int64  `json:"unit_price"`
+				Quantity    int64  `json:"quantity"`
+				Subtotal    int64  `json:"subtotal"`
+			} `json:"order_items"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatal(err)
+	}
+	if env.Data.Amount != 90000 || env.Data.Status != string(model.TransactionStatusPaid) {
+		t.Fatalf("existing payment fields must remain present, got %+v", env.Data)
+	}
+	if len(env.Data.OrderItems) != 2 {
+		t.Fatalf("expected 2 order items, got %+v", env.Data.OrderItems)
+	}
+	first, second := env.Data.OrderItems[0], env.Data.OrderItems[1]
+	if first.ProductName != "Kopi Arabika" || first.UnitPrice != 35000 || first.Quantity != 2 || first.Subtotal != 70000 {
+		t.Errorf("first item mismatch: %+v", first)
+	}
+	if second.ProductName != "Teh Hijau" || second.UnitPrice != 20000 || second.Quantity != 1 || second.Subtotal != 20000 {
+		t.Errorf("second item mismatch: %+v", second)
+	}
+}
+
+func TestDashboardPhase9_PaymentDetail_OmitsOrderItemsWhenAbsent(t *testing.T) {
+	deps := newDashPhase9Router(model.DashboardUserRoleViewer)
+	txID := uuid.New()
+	created := time.Now().UTC()
+	deps.paymentSvc.getResp = &model.PaymentResponse{
+		TransactionID:   txID,
+		MerchantOrderID: "ord-legacy",
+		Amount:          50000,
+		Currency:        "IDR",
+		Status:          model.TransactionStatusPending,
+		CreatedAt:       created,
+		UpdatedAt:       created,
+	}
+	deps.paymentSvc.detailItems = nil
+
+	w := dashDo(deps.router, http.MethodGet, "/api/v1/dashboard/payments/"+txID.String(), nil, "token")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	var env struct {
+		Data map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := env.Data["order_items"]; present {
+		t.Fatalf("order_items must be omitted for payments without items, got %v", env.Data["order_items"])
+	}
+	if env.Data["amount"] != float64(50000) {
+		t.Fatalf("existing payment total must remain visible, got %v", env.Data["amount"])
 	}
 }
 

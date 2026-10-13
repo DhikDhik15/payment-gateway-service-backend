@@ -333,6 +333,35 @@ func main() {
 	// Phase 9: dashboard overview aggregates.
 	dashboardOverviewRepo := repository.NewDashboardOverviewRepository(pool)
 	dashboardOverviewSvc := service.NewDashboardOverviewService(dashboardOverviewRepo, paymentSvc)
+	categoryRepo := repository.NewCategoryRepository(pool)
+	productRepo := repository.NewProductRepository(pool)
+	categorySvc := service.NewCategoryService(categoryRepo)
+	orderRepo := repository.NewOrderRepository(pool)
+	orderSvc := service.NewOrderService(orderRepo)
+	orderPaymentSvc := service.NewOrderPaymentService(paymentSvc, orderRepo)
+
+	// Product image uploads — persistent local storage on a Docker-mounted
+	// volume (never ephemeral container storage). The reference counter is
+	// the product repository itself, so a backing file is deleted only when
+	// no product references its URL anymore.
+	imageCounter, ok := productRepo.(repository.ProductImageCounter)
+	if !ok {
+		slog.Error("product repository does not support image reference counting")
+		os.Exit(1)
+	}
+	productImageStore := service.NewLocalProductImageStore(
+		service.ProductImageConfig{
+			Dir:          cfg.ProductImage.Dir,
+			MaxBytes:     cfg.ProductImage.MaxBytes,
+			MaxDimension: cfg.ProductImage.MaxDimension,
+			MaxPixels:    cfg.ProductImage.MaxPixels,
+		},
+		imageCounter.CountByImageURL,
+	)
+	productImageSvc := service.NewProductImageService(productRepo, productImageStore)
+	// Product CRUD with image janitor: replacing or deleting a product's
+	// local image releases the backing file once nothing references it.
+	productSvc := service.NewProductServiceWithImageJanitor(productRepo, categoryRepo, productImageStore)
 
 	// -------------------------------------------------------------------------
 	// Dependencies — Handlers
@@ -357,6 +386,16 @@ func main() {
 	invitationHandler := handler.NewInvitationHandler(invitationSvc)
 	// Phase 9: dashboard resource handlers (Bearer JWT only).
 	dashboardOverviewHandler := handler.NewDashboardOverviewHandler(dashboardOverviewSvc)
+	dashboardCategoryHandler := handler.NewDashboardCategoryHandler(categorySvc)
+	dashboardProductHandler := handler.NewDashboardProductHandler(productSvc)
+	dashboardProductImageHandler := handler.NewDashboardProductImageHandler(productImageSvc, service.ProductImageConfig{
+		Dir:          cfg.ProductImage.Dir,
+		MaxBytes:     cfg.ProductImage.MaxBytes,
+		MaxDimension: cfg.ProductImage.MaxDimension,
+		MaxPixels:    cfg.ProductImage.MaxPixels,
+	})
+	dashboardOrderHandler := handler.NewDashboardOrderHandler(orderSvc)
+	dashboardOrderPaymentHandler := handler.NewDashboardOrderPaymentHandler(orderPaymentSvc)
 	dashboardPaymentHandler := handler.NewDashboardPaymentHandler(paymentSvc, refundSvc, webhookSvc, cfg.Webhook.MockSecret)
 	dashboardRefundHandler := handler.NewDashboardRefundHandler(refundSvc)
 	dashboardAPIKeyHandler := handler.NewDashboardAPIKeyHandler(apiKeySvc)
@@ -519,6 +558,13 @@ func main() {
 			webhooks.POST("/providers/:provider", webhookHandler.Receive)
 		}
 
+		// Public product image serving (NO dashboard auth — product images
+		// are public catalog assets, like the external HTTPS image_url values
+		// they replace). References are server-generated UUID paths, so the
+		// URL itself is the unguessable capability; merchant scoping was
+		// enforced at upload time.
+		v1.GET("/product-images/:merchant_id/:filename", dashboardProductImageHandler.ServeProductImage)
+
 		// Settlement and reconciliation endpoints use the dedicated ops key.
 		// Merchant API keys are intentionally not accepted here.
 		// Phase 8D.1: the admin client-IP limiter runs BEFORE AdminAuth so
@@ -612,6 +658,61 @@ func main() {
 			// Phase 8A: self-service password change — identity comes from the
 			// authenticated session; no user_id is ever accepted from the client.
 			dashboard.PATCH("/me/password", dashboardUserHandler.ChangePassword)
+
+			// Phase 7: categories + products.
+			dashboard.GET("/categories", dashboardCategoryHandler.ListCategories)
+			dashboard.POST("/categories",
+				middleware.RequireRole(model.DashboardUserRoleOwner, model.DashboardUserRoleAdmin),
+				dashboardCategoryHandler.CreateCategory,
+			)
+			dashboard.GET("/categories/:category_id", dashboardCategoryHandler.GetCategory)
+			dashboard.PATCH("/categories/:category_id",
+				middleware.RequireRole(model.DashboardUserRoleOwner, model.DashboardUserRoleAdmin),
+				dashboardCategoryHandler.UpdateCategory,
+			)
+			dashboard.DELETE("/categories/:category_id",
+				middleware.RequireRole(model.DashboardUserRoleOwner, model.DashboardUserRoleAdmin),
+				dashboardCategoryHandler.DeleteCategory,
+			)
+			dashboard.GET("/products", dashboardProductHandler.ListProducts)
+			dashboard.POST("/products",
+				middleware.RequireRole(model.DashboardUserRoleOwner, model.DashboardUserRoleAdmin),
+				dashboardProductHandler.CreateProduct,
+			)
+			dashboard.GET("/products/:product_id", dashboardProductHandler.GetProduct)
+			dashboard.PATCH("/products/:product_id",
+				middleware.RequireRole(model.DashboardUserRoleOwner, model.DashboardUserRoleAdmin),
+				dashboardProductHandler.UpdateProduct,
+			)
+			dashboard.DELETE("/products/:product_id",
+				middleware.RequireRole(model.DashboardUserRoleOwner, model.DashboardUserRoleAdmin),
+				dashboardProductHandler.DeleteProduct,
+			)
+			// Product image uploads (OWNER/ADMIN only; VIEWER reads). The
+			// upload returns a stable image_url without touching any product;
+			// linking reuses PATCH /products/:product_id, and DELETE .../image
+			// clears the reference with unreferenced-file cleanup.
+			dashboard.POST("/product-images",
+				middleware.RequireRole(model.DashboardUserRoleOwner, model.DashboardUserRoleAdmin),
+				dashboardProductImageHandler.UploadProductImage,
+			)
+			dashboard.DELETE("/products/:product_id/image",
+				middleware.RequireRole(model.DashboardUserRoleOwner, model.DashboardUserRoleAdmin),
+				dashboardProductImageHandler.DeleteProductImage,
+			)
+
+			// Phase 8A: orders only; no payment, stock or server-side cart.
+			dashboard.POST("/orders",
+				middleware.RequireRole(model.DashboardUserRoleOwner, model.DashboardUserRoleAdmin),
+				dashboardOrderHandler.CreateOrder,
+			)
+			dashboard.GET("/orders", dashboardOrderHandler.ListOrders)
+			dashboard.GET("/orders/:order_id", dashboardOrderHandler.GetOrder)
+			dashboard.GET("/orders/:order_id/payments", dashboardOrderPaymentHandler.ListPayments)
+			dashboard.POST("/orders/:order_id/payments",
+				middleware.RequireRole(model.DashboardUserRoleOwner, model.DashboardUserRoleAdmin),
+				dashboardOrderPaymentHandler.CreatePayment,
+			)
 
 			// Phase 9: overview + payments (all roles: OWNER, ADMIN, VIEWER).
 			dashboard.GET("/overview", dashboardOverviewHandler.GetOverview)
@@ -760,6 +861,22 @@ func main() {
 	// -------------------------------------------------------------------------
 	// HTTP Server with graceful shutdown
 	// -------------------------------------------------------------------------
+	// Product image uploads: log the effective storage/validation config
+	// (paths and limits only — never credentials) and warn when the global
+	// HTTP body cap would 413 uploads before validation runs.
+	slog.Info("product image uploads configured",
+		slog.String("dir", cfg.ProductImage.Dir),
+		slog.Int64("max_bytes", cfg.ProductImage.MaxBytes),
+		slog.Int("max_dimension", cfg.ProductImage.MaxDimension),
+		slog.Int64("max_pixels", cfg.ProductImage.MaxPixels),
+	)
+	if cfg.HTTP.MaxBodyBytes <= cfg.ProductImage.MaxBytes {
+		slog.Warn("HTTP_MAX_BODY_BYTES is not above PRODUCT_IMAGE_MAX_BYTES; image uploads will be rejected with 413 before validation — raise HTTP_MAX_BODY_BYTES comfortably above the image limit (multipart framing overhead)",
+			slog.Int64("max_body_bytes", cfg.HTTP.MaxBodyBytes),
+			slog.Int64("product_image_max_bytes", cfg.ProductImage.MaxBytes),
+		)
+	}
+
 	srv := newHTTPServer(fmt.Sprintf(":%s", cfg.App.Port), r, cfg.HTTP)
 
 	serverErrCh := make(chan error, 1)

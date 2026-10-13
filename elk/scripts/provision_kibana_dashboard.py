@@ -12,6 +12,19 @@ DATA_VIEW_ID = os.environ.get("DATA_VIEW_ID", "go-saas-payment-gateway-logs")
 DASHBOARD_ID = os.environ.get("DASHBOARD_ID", "go-saas-payment-gateway-overview")
 MAX_WAIT_SECONDS = int(os.environ.get("MAX_WAIT_SECONDS", "180"))
 SLEEP_SECONDS = int(os.environ.get("SLEEP_SECONDS", "5"))
+# Optional Kibana Basic auth (required when Elasticsearch security is enabled,
+# which turns on Kibana authentication). Empty = anonymous (legacy dev mode).
+KIBANA_USER = os.environ.get("KIBANA_USER", "")
+KIBANA_PASSWORD = os.environ.get("KIBANA_PASSWORD", "")
+
+
+def _auth_header():
+    if not KIBANA_USER:
+        return {}
+    import base64
+    token = base64.b64encode(
+        f"{KIBANA_USER}:{KIBANA_PASSWORD}".encode()).decode()
+    return {"Authorization": f"Basic {token}"}
 
 HTTP_REQUEST = 'app_log.msg.keyword : "http request"'
 WEBHOOK_BATCH = 'app_log.msg.keyword : "merchant webhook worker: deliveries processed"'
@@ -24,6 +37,8 @@ def req(method, path, body=None):
     r = urllib.request.Request(url, data=data, method=method)
     r.add_header("kbn-xsrf", "true")
     r.add_header("Content-Type", "application/json")
+    for k, v in _auth_header().items():
+        r.add_header(k, v)
     try:
         with urllib.request.urlopen(r) as resp:
             return resp.status, resp.read().decode()

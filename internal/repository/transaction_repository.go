@@ -9,6 +9,7 @@ import (
 	"github.com/dhikaarta/pay-gate-backend/internal/model"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -66,6 +67,25 @@ type TransactionRepository interface {
 	CountList(ctx context.Context, merchantID uuid.UUID, filter model.TransactionListFilter) (int64, error)
 }
 
+// OrderPaymentLookup is implemented by PostgreSQL transaction repositories to
+// inspect payment attempts without expanding the generic repository contract.
+type OrderPaymentLookup interface {
+	FindByMerchantAndOrderID(ctx context.Context, merchantID, orderID uuid.UUID) ([]*model.Transaction, error)
+}
+
+// OrderSummaryLookup is implemented by PostgreSQL transaction repositories to
+// batch-load product-name summaries for order-linked transactions in a single
+// query. It is intentionally narrow (like OrderPaymentLookup) so display
+// enrichment never forces N+1 order fetches on list endpoints. Repositories
+// that do not implement it simply yield no summaries and clients fall back
+// to merchant_order_id.
+type OrderSummaryLookup interface {
+	// GetOrderSummaries returns summaries keyed by order ID for the requested
+	// merchant-scoped orders that have at least one usable product name.
+	// Orders without items (or unknown IDs) are absent from the map.
+	GetOrderSummaries(ctx context.Context, merchantID uuid.UUID, orderIDs []uuid.UUID) (map[uuid.UUID]*model.OrderSummary, error)
+}
+
 // pgTransactionRepository is the PostgreSQL implementation.
 type pgTransactionRepository struct {
 	db *pgxpool.Pool
@@ -76,18 +96,25 @@ func NewTransactionRepository(db *pgxpool.Pool) TransactionRepository {
 	return &pgTransactionRepository{db: db}
 }
 
+func IsOrderPaymentConflict(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) &&
+		(pgErr.ConstraintName == "uq_transactions_order_active" || pgErr.ConstraintName == "uq_transactions_order_paid")
+}
+
 // Create inserts a transaction row. All fields must be populated by the caller.
 func (r *pgTransactionRepository) Create(ctx context.Context, tx *model.Transaction) error {
 	const q = `
 		INSERT INTO transactions
-		    (id, merchant_id, merchant_order_id, amount, currency,
+		    (id, merchant_id, order_id, merchant_order_id, amount, currency,
 		     payment_method, provider, provider_transaction_id, payment_url,
 		     status, expired_at, paid_at, created_at, updated_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
 	`
 	_, err := r.db.Exec(ctx, q,
 		tx.ID,
 		tx.MerchantID,
+		tx.OrderID,
 		tx.MerchantOrderID,
 		tx.Amount,
 		tx.Currency,
@@ -102,9 +129,117 @@ func (r *pgTransactionRepository) Create(ctx context.Context, tx *model.Transact
 		tx.UpdatedAt,
 	)
 	if err != nil {
+		if IsOrderPaymentConflict(err) {
+			return ErrOrderPaymentConflict
+		}
 		return fmt.Errorf("transaction repository create: %w", err)
 	}
 	return nil
+}
+
+func (r *pgTransactionRepository) FindByMerchantAndOrderID(ctx context.Context, merchantID, orderID uuid.UUID) ([]*model.Transaction, error) {
+	q := fmt.Sprintf(`SELECT %s FROM transactions WHERE merchant_id = $1 AND order_id = $2 ORDER BY created_at DESC, id DESC`, TransactionSelectCols)
+	rows, err := r.db.Query(ctx, q, merchantID, orderID)
+	if err != nil {
+		return nil, fmt.Errorf("transaction repository find by merchant and order: %w", err)
+	}
+	defer rows.Close()
+	transactions := make([]*model.Transaction, 0)
+	for rows.Next() {
+		transaction, err := scanTransaction(rows)
+		if err != nil {
+			return nil, fmt.Errorf("transaction repository find by merchant and order scan: %w", err)
+		}
+		transactions = append(transactions, transaction)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("transaction repository find by merchant and order rows: %w", err)
+	}
+	return transactions, nil
+}
+
+// OrderItemsLookup is a narrow display-enrichment interface (like
+// OrderSummaryLookup) so payment detail can embed immutable order-item rows
+// without forcing N+1 order fetches. Repositories that do not implement it
+// simply yield no items and callers omit the breakdown.
+type OrderItemsLookup interface {
+	// GetOrderItems returns the merchant-scoped order's immutable item
+	// snapshots in canonical order (product_id NULLS LAST, id).
+	GetOrderItems(ctx context.Context, merchantID, orderID uuid.UUID) ([]model.OrderItem, error)
+}
+
+// GetOrderItems implements OrderItemsLookup with a single merchant-scoped
+// query in canonical item order.
+func (r *pgTransactionRepository) GetOrderItems(ctx context.Context, merchantID, orderID uuid.UUID) ([]model.OrderItem, error) {
+	const q = `
+		SELECT id, order_id, merchant_id, product_id, product_name, quantity, unit_price, subtotal, created_at
+		    FROM order_items
+		    WHERE merchant_id = $1
+		      AND order_id = $2
+		    ORDER BY product_id NULLS LAST, id
+	`
+	rows, err := r.db.Query(ctx, q, merchantID, orderID)
+	if err != nil {
+		return nil, fmt.Errorf("transaction repository order items: %w", err)
+	}
+	defer rows.Close()
+	items := make([]model.OrderItem, 0)
+	for rows.Next() {
+		var item model.OrderItem
+		if err := rows.Scan(&item.ID, &item.OrderID, &item.MerchantID, &item.ProductID,
+			&item.ProductName, &item.Quantity, &item.UnitPrice, &item.Subtotal, &item.CreatedAt); err != nil {
+			return nil, fmt.Errorf("transaction repository order items scan: %w", err)
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("transaction repository order items rows: %w", err)
+	}
+	return items, nil
+}
+
+// GetOrderSummaries implements OrderSummaryLookup in a single aggregate query
+// over the immutable order_items snapshots — no per-order fetching. Names use
+// the canonical item order (product_id NULLS LAST, id); only the first two
+// are kept to bound list payloads. Orders without usable product names are
+// absent from the map so callers can omit the summary field.
+func (r *pgTransactionRepository) GetOrderSummaries(ctx context.Context, merchantID uuid.UUID, orderIDs []uuid.UUID) (map[uuid.UUID]*model.OrderSummary, error) {
+	summaries := make(map[uuid.UUID]*model.OrderSummary)
+	if len(orderIDs) == 0 {
+		return summaries, nil
+	}
+	const q = `
+		SELECT order_id,
+		       (array_agg(product_name ORDER BY product_id NULLS LAST, id))[1:2] AS names,
+		       count(*) AS n
+		    FROM order_items
+		    WHERE merchant_id = $1
+		      AND order_id = ANY($2)
+		      AND product_name IS NOT NULL
+		      AND btrim(product_name) <> ''
+		    GROUP BY order_id
+	`
+	rows, err := r.db.Query(ctx, q, merchantID, orderIDs)
+	if err != nil {
+		return nil, fmt.Errorf("transaction repository order summaries: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var orderID uuid.UUID
+		var names []string
+		var n int64
+		if err := rows.Scan(&orderID, &names, &n); err != nil {
+			return nil, fmt.Errorf("transaction repository order summaries scan: %w", err)
+		}
+		if len(names) == 0 || n == 0 {
+			continue
+		}
+		summaries[orderID] = &model.OrderSummary{ProductNames: names, ProductCount: int(n)}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("transaction repository order summaries rows: %w", err)
+	}
+	return summaries, nil
 }
 
 // FindByID retrieves a transaction by primary key.
@@ -371,7 +506,7 @@ func buildListQuery(countOnly bool, merchantID uuid.UUID, filter model.Transacti
 }
 
 // TransactionSelectCols is the standard SELECT column list for transactions.
-const TransactionSelectCols = `id, merchant_id, merchant_order_id, amount, currency,
+const TransactionSelectCols = `id, merchant_id, order_id, merchant_order_id, amount, currency,
 		       payment_method, provider, provider_transaction_id, payment_url,
 		       status, expired_at, paid_at, refunded_amount, reserved_refund_amount,
 		       created_at, updated_at`
@@ -383,6 +518,7 @@ func scanTransaction(row pgx.Row) (*model.Transaction, error) {
 	err := row.Scan(
 		&t.ID,
 		&t.MerchantID,
+		&t.OrderID,
 		&t.MerchantOrderID,
 		&t.Amount,
 		&t.Currency,

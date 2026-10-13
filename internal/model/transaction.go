@@ -1,6 +1,7 @@
 package model
 
 import (
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -23,6 +24,7 @@ const (
 var allowedTransitions = map[TransactionStatus][]TransactionStatus{
 	TransactionStatusCreated: {
 		TransactionStatusPending,
+		TransactionStatusFailed,
 		TransactionStatusCancelled,
 	},
 	TransactionStatusPending: {
@@ -68,6 +70,7 @@ func (s TransactionStatus) IsCancellable() bool {
 type Transaction struct {
 	ID                    uuid.UUID         `db:"id"`
 	MerchantID            uuid.UUID         `db:"merchant_id"`
+	OrderID               *uuid.UUID        `db:"order_id" json:"order_id,omitempty"`
 	MerchantOrderID       string            `db:"merchant_order_id"`
 	Amount                int64             `db:"amount"`
 	Currency              string            `db:"currency"`
@@ -143,16 +146,24 @@ const (
 
 // CreatePaymentRequest is the validated input for the create-payment endpoint.
 type CreatePaymentRequest struct {
-	MerchantOrderID string `json:"merchant_order_id" binding:"required,min=1,max=100"`
-	Amount          int64  `json:"amount"            binding:"required,min=1"`
-	Currency        string `json:"currency"          binding:"required,len=3"`
-	PaymentMethod   string `json:"payment_method"    binding:"required"`
+	MerchantOrderID string     `json:"merchant_order_id" binding:"required,min=1,max=100"`
+	Amount          int64      `json:"amount"            binding:"required,min=1"`
+	Currency        string     `json:"currency"          binding:"required,len=3"`
+	PaymentMethod   string     `json:"payment_method"    binding:"required"`
+	OrderID         *uuid.UUID `json:"-"`
+}
+
+// CreateOrderPaymentRequest is the only client input for Order-backed payment
+// initiation. Amount, currency, merchant, and merchant_order_id are derived.
+type CreateOrderPaymentRequest struct {
+	PaymentMethod string `json:"payment_method" binding:"required"`
 }
 
 // CreatePaymentResponse is returned on successful payment creation (HTTP 201).
 // It includes provider-specific fields that are only known at creation time.
 type CreatePaymentResponse struct {
 	TransactionID         uuid.UUID         `json:"transaction_id"`
+	OrderID               *uuid.UUID        `json:"order_id,omitempty"`
 	MerchantOrderID       string            `json:"merchant_order_id"`
 	Amount                int64             `json:"amount"`
 	Currency              string            `json:"currency"`
@@ -168,6 +179,7 @@ type CreatePaymentResponse struct {
 // PaymentResponse is returned when retrieving an existing payment (GET / cancel).
 type PaymentResponse struct {
 	TransactionID         uuid.UUID         `json:"transaction_id"`
+	OrderID               *uuid.UUID        `json:"order_id,omitempty"`
 	MerchantOrderID       string            `json:"merchant_order_id"`
 	Amount                int64             `json:"amount"`
 	Currency              string            `json:"currency"`
@@ -180,4 +192,48 @@ type PaymentResponse struct {
 	PaidAt                *time.Time        `json:"paid_at,omitempty"`
 	CreatedAt             time.Time         `json:"created_at"`
 	UpdatedAt             time.Time         `json:"updated_at"`
+	// OrderSummary is an optional, additive snapshot of the linked order's
+	// product makeup, built from immutable order_items rows. Omitted for
+	// transactions without a linked order (or when the summary cannot be
+	// resolved); clients must fall back to merchant_order_id.
+	OrderSummary *OrderSummary `json:"order_summary,omitempty"`
+}
+
+// OrderSummary describes the product makeup of a transaction's linked order
+// for display purposes (e.g. Recent Transactions titles).
+//
+// ProductNames carries the first entries in stable order-item order
+// (product_id NULLS LAST, id); at most orderSummaryNameLimit names are kept
+// to bound list payloads. ProductCount is the number of distinct product
+// lines with a usable name. Names come from the immutable order_items
+// snapshot taken at purchase time — never from the live product catalog.
+type OrderSummary struct {
+	ProductNames []string `json:"product_names"`
+	ProductCount int      `json:"product_count"`
+}
+
+// orderSummaryNameLimit bounds the embedded names per transaction.
+const orderSummaryNameLimit = 2
+
+// SummarizeOrderItems builds an [OrderSummary] from an order's items.
+// Blank product names are skipped; nil is returned when no usable name
+// exists (including an empty order) so callers can omit the field and let
+// clients use their merchant-order fallback.
+func SummarizeOrderItems(items []OrderItem) *OrderSummary {
+	names := make([]string, 0, orderSummaryNameLimit)
+	count := 0
+	for _, item := range items {
+		name := strings.TrimSpace(item.ProductName)
+		if name == "" {
+			continue
+		}
+		count++
+		if len(names) < orderSummaryNameLimit {
+			names = append(names, name)
+		}
+	}
+	if count == 0 {
+		return nil
+	}
+	return &OrderSummary{ProductNames: names, ProductCount: count}
 }

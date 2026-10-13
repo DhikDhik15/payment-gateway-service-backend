@@ -4,7 +4,7 @@
 
 .PHONY: all run build test test-integration fmt fmt-check vet \
         docker-up docker-down docker-build docker-logs docker-validate \
-        elk-up elk-down elk-provision elk-provision-dashboard elk-dashboard \
+        elk-up elk-down elk-provision elk-provision-dashboard elk-dashboard elk-certs elk-auth-setup elk-tls-check \
         migrate-up migrate-down migrate-status migrate-create \
         swagger lint clean help
 
@@ -108,14 +108,45 @@ elk-up:
 
 ## elk-provision: wait for Kibana readiness and provision Data View + Dashboard (idempotent)
 elk-provision:
-	KIBANA_URL=$(KIBANA_URL) ./elk/scripts/provision-kibana-dataview.sh
-	KIBANA_URL=$(KIBANA_URL) ./elk/scripts/provision-kibana-dashboard.sh
+	@if [ -f .env.elk ]; then set -a; . ./.env.elk; set +a; \
+	  KIBANA_USER=elastic KIBANA_PASSWORD="$${ELASTIC_PASSWORD}" KIBANA_URL=$(KIBANA_URL) ./elk/scripts/provision-kibana-dataview.sh; \
+	  KIBANA_USER=elastic KIBANA_PASSWORD="$${ELASTIC_PASSWORD}" KIBANA_URL=$(KIBANA_URL) ./elk/scripts/provision-kibana-dashboard.sh; \
+	else \
+	  KIBANA_URL=$(KIBANA_URL) ./elk/scripts/provision-kibana-dataview.sh; \
+	  KIBANA_URL=$(KIBANA_URL) ./elk/scripts/provision-kibana-dashboard.sh; \
+	fi
 
 ## elk-provision-dashboard: provision only the dashboard (idempotent)
 elk-provision-dashboard:
-	KIBANA_URL=$(KIBANA_URL) ./elk/scripts/provision-kibana-dashboard.sh
+	@if [ -f .env.elk ]; then set -a; . ./.env.elk; set +a; \
+	  KIBANA_USER=elastic KIBANA_PASSWORD="$${ELASTIC_PASSWORD}" KIBANA_URL=$(KIBANA_URL) ./elk/scripts/provision-kibana-dashboard.sh; \
+	else \
+	  KIBANA_URL=$(KIBANA_URL) ./elk/scripts/provision-kibana-dashboard.sh; \
+	fi
 
 elk-dashboard: elk-provision-dashboard
+
+## elk-certs: generate development TLS certificates for ELK stack
+elk-certs:
+	./elk/scripts/generate-dev-certs.sh
+
+## elk-auth-setup: bootstrap the elastic password + Kibana service token into .env.elk (gitignored, mode 600)
+elk-auth-setup:
+	./elk/scripts/setup-elk-auth.sh
+
+## elk-tls-check: verify ELK TLS connectivity (Elasticsearch HTTPS with CA + auth, Kibana status)
+elk-tls-check:
+	@test -f .env.elk || (echo "Missing .env.elk; run 'make elk-auth-setup' first"; exit 1)
+	@echo "=== Elasticsearch HTTPS check (CA verification + auth) ==="
+	@set -a; . ./.env.elk; set +a; \
+	curl --fail --silent --show-error --cacert ./elk/certs/ca/ca.crt \
+	  -u "elastic:$${ELASTIC_PASSWORD}" https://localhost:9200 >/dev/null && echo "ES HTTPS OK (200, CA verified)"
+	@echo "=== Elasticsearch cluster health ==="
+	@set -a; . ./.env.elk; set +a; \
+	curl --fail --silent --show-error --cacert ./elk/certs/ca/ca.crt \
+	  -u "elastic:$${ELASTIC_PASSWORD}" 'https://localhost:9200/_cluster/health?pretty'
+	@echo "=== Kibana status check ==="
+	@curl --fail --silent --show-error http://localhost:5601/api/status && echo
 
 ## elk-down: stop and remove the ELK stack
 elk-down:

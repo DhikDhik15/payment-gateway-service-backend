@@ -31,6 +31,7 @@ type Config struct {
 	EmailCleanup    EmailCleanupConfig
 	RateLimit       RateLimitConfig
 	HTTP            HTTPConfig
+	ProductImage    ProductImageConfig
 }
 
 // AuthConfig holds configuration for Phase 8 dashboard JWT authentication.
@@ -130,6 +131,24 @@ type HTTPConfig struct {
 	ReadTimeout       time.Duration // HTTP_READ_TIMEOUT (default 15s)
 	WriteTimeout      time.Duration // HTTP_WRITE_TIMEOUT (default 15s)
 	IdleTimeout       time.Duration // HTTP_IDLE_TIMEOUT (default 60s)
+}
+
+// ProductImageConfig controls merchant product image uploads: validation
+// limits and the persistent local storage directory. The directory MUST be a
+// Docker-mounted persistent volume in container deployments — files stored
+// only in the container's ephemeral layer are lost on recreation (the app
+// container runs read_only, so the volume mount is also what makes writes
+// possible at all).
+//
+// NOTE: the global HTTP_MAX_BODY_BYTES limit applies before the upload
+// handler runs, so operators must set HTTP_MAX_BODY_BYTES comfortably above
+// PRODUCT_IMAGE_MAX_BYTES (multipart framing overhead) or large uploads are
+// rejected with 413 before validation.
+type ProductImageConfig struct {
+	Dir          string // PRODUCT_IMAGE_DIR (default ./storage/product-images)
+	MaxBytes     int64  // PRODUCT_IMAGE_MAX_BYTES (default 5242880 = 5 MiB)
+	MaxDimension int    // PRODUCT_IMAGE_MAX_DIMENSION (default 4096 px per side)
+	MaxPixels    int64  // PRODUCT_IMAGE_MAX_PIXELS (default 16777216)
 }
 
 // WebhookDeliveryConfig controls outbound merchant webhook delivery (Phase 6).
@@ -503,6 +522,12 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 
+	// ── Product image uploads: validation limits + persistent storage dir ──
+	productImageCfg, err := parseProductImageConfig()
+	if err != nil {
+		return nil, err
+	}
+
 	// ── Phase 8D.2: trusted reverse proxies (ClientIP / X-Forwarded-For) ──
 	trustedProxies, err := parseTrustedProxies()
 	if err != nil {
@@ -606,6 +631,7 @@ func Load() (*Config, error) {
 		EmailCleanup: emailCleanupCfg,
 		RateLimit:    rateLimitCfg,
 		HTTP:         httpCfg,
+		ProductImage: productImageCfg,
 	}
 
 	return cfg, nil
@@ -893,6 +919,39 @@ func parseHTTPConfig() (HTTPConfig, error) {
 		ReadTimeout:       readTimeout,
 		WriteTimeout:      writeTimeout,
 		IdleTimeout:       idleTimeout,
+	}, nil
+}
+
+// parseProductImageConfig resolves the product image upload settings.
+// Extracted in the parseHTTPConfig style so the validation contract is
+// unit-testable without booting the whole Config.
+//
+// Every knob must be strictly positive — a zero or negative limit is rejected
+// at startup so a typo can never silently disable upload validation, and an
+// empty directory is rejected so files can never land in an unintended
+// location.
+func parseProductImageConfig() (ProductImageConfig, error) {
+	dir := strings.TrimSpace(getEnv("PRODUCT_IMAGE_DIR", "./storage/product-images"))
+	if dir == "" {
+		return ProductImageConfig{}, fmt.Errorf("invalid PRODUCT_IMAGE_DIR: must not be empty")
+	}
+	maxBytes, err := strconv.ParseInt(getEnv("PRODUCT_IMAGE_MAX_BYTES", "5242880"), 10, 64)
+	if err != nil || maxBytes < 1 {
+		return ProductImageConfig{}, fmt.Errorf("invalid PRODUCT_IMAGE_MAX_BYTES: must be a positive integer")
+	}
+	maxDimension, err := strconv.Atoi(getEnv("PRODUCT_IMAGE_MAX_DIMENSION", "4096"))
+	if err != nil || maxDimension < 1 {
+		return ProductImageConfig{}, fmt.Errorf("invalid PRODUCT_IMAGE_MAX_DIMENSION: must be a positive integer")
+	}
+	maxPixels, err := strconv.ParseInt(getEnv("PRODUCT_IMAGE_MAX_PIXELS", "16777216"), 10, 64)
+	if err != nil || maxPixels < 1 {
+		return ProductImageConfig{}, fmt.Errorf("invalid PRODUCT_IMAGE_MAX_PIXELS: must be a positive integer")
+	}
+	return ProductImageConfig{
+		Dir:          dir,
+		MaxBytes:     maxBytes,
+		MaxDimension: maxDimension,
+		MaxPixels:    maxPixels,
 	}, nil
 }
 

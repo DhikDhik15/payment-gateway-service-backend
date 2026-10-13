@@ -87,6 +87,9 @@ func (h *DashboardPaymentHandler) ListPayments(c *gin.Context) {
 //	@Summary		Get dashboard payment detail
 //	@Description	Returns a payment belonging to the authenticated merchant, plus a timeline
 //	@Description	derived only from persisted timestamps (CREATED, PAID).
+//	@Description	Order-backed payments additionally carry the immutable order-item
+//	@Description	snapshots (product name, unit price, quantity, stored subtotal) as
+//	@Description	`order_items` for the product breakdown; omitted when unavailable.
 //	@Tags			Dashboard Payments
 //	@Produce		json
 //	@Security		BearerAuth
@@ -110,15 +113,16 @@ func (h *DashboardPaymentHandler) GetPayment(c *gin.Context) {
 		return
 	}
 
-	payment, err := h.paymentSvc.GetPayment(c.Request.Context(), caller.MerchantID, paymentID)
+	payment, err := h.paymentSvc.GetPaymentDetail(c.Request.Context(), caller.MerchantID, paymentID)
 	if err != nil {
 		h.handlePaymentError(c, err)
 		return
 	}
 
 	response.OK(c, model.DashboardPaymentDetailResponse{
-		PaymentResponse: *payment,
-		Timeline:        buildPaymentTimeline(payment),
+		PaymentResponse: payment.PaymentResponse,
+		Timeline:        buildPaymentTimeline(&payment.PaymentResponse),
+		OrderItems:      payment.OrderItems,
 	})
 }
 

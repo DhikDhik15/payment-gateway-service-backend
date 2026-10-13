@@ -60,7 +60,14 @@ services:
       RATE_LIMIT_API_PER_MINUTE: ${RATE_LIMIT_API_PER_MINUTE:-120}
       # Phase 8D.2: inbound HTTP hardening (defaults shown; all validated
       # fail-fast at startup — zero/negative values are rejected).
-      HTTP_MAX_BODY_BYTES: ${HTTP_MAX_BODY_BYTES:-1048576}
+      # Phase 10D: the default (6 MiB) stays comfortably above
+      # PRODUCT_IMAGE_MAX_BYTES (5 MiB) plus multipart framing overhead,
+      # because the global body cap rejects requests before the upload
+      # handler runs. Trade-off: the global cap for every route rises from 1
+      # to 6 MiB; JSON endpoints are unaffected in practice (payloads are
+      # orders of magnitude smaller) and the middleware still hard-caps all
+      # bodies. Lower it only if image uploads are disabled.
+      HTTP_MAX_BODY_BYTES: ${HTTP_MAX_BODY_BYTES:-6291456}
       HTTP_READ_HEADER_TIMEOUT: ${HTTP_READ_HEADER_TIMEOUT:-10s}
       HTTP_READ_TIMEOUT: ${HTTP_READ_TIMEOUT:-15s}
       HTTP_WRITE_TIMEOUT: ${HTTP_WRITE_TIMEOUT:-15s}
@@ -120,6 +127,20 @@ services:
       EMAIL_CLEANUP_BATCH_SIZE: ${EMAIL_CLEANUP_BATCH_SIZE:-100}
       EMAIL_OUTBOX_SENT_RETENTION: ${EMAIL_OUTBOX_SENT_RETENTION:-168h}
       EMAIL_OUTBOX_DEAD_RETENTION: ${EMAIL_OUTBOX_DEAD_RETENTION:-720h}
+      # Product image uploads — persistent local storage (Docker named volume
+      # below; never ephemeral container storage). PRODUCT_IMAGE_DIR must
+      # match the volume mount path. NOTE: HTTP_MAX_BODY_BYTES applies before
+      # the upload handler runs, so it must stay comfortably above
+      # PRODUCT_IMAGE_MAX_BYTES (multipart framing overhead included).
+      PRODUCT_IMAGE_DIR: ${PRODUCT_IMAGE_DIR:-/app/storage/product-images}
+      PRODUCT_IMAGE_MAX_BYTES: ${PRODUCT_IMAGE_MAX_BYTES:-5242880}
+      PRODUCT_IMAGE_MAX_DIMENSION: ${PRODUCT_IMAGE_MAX_DIMENSION:-4096}
+      PRODUCT_IMAGE_MAX_PIXELS: ${PRODUCT_IMAGE_MAX_PIXELS:-16777216}
+    volumes:
+      # Named volume for uploaded product images — survives `docker compose
+      # down` and container recreation. Back this volume up; it is the
+      # system of record for image bytes (the DB holds only references).
+      - product-images:/app/storage/product-images:rw
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -164,3 +185,9 @@ networks:
   pay-gate-net:
     name: pay-gate-network
     driver: bridge
+
+volumes:
+  # Persistent product image bytes for the backend local image store.
+  product-images:
+    name: pay-gate-product-images
+    driver: local

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strings"
 	"sync/atomic"
@@ -95,12 +96,28 @@ func (m *MockPaymentProvider) CreatePaymentCallCount() uint64 {
 }
 
 // GetPayment simulates querying a payment's current status.
-func (m *MockPaymentProvider) GetPayment(_ context.Context, providerTransactionID string) (*ProviderPaymentResponse, error) {
+func (m *MockPaymentProvider) GetPayment(ctx context.Context, providerTransactionID string) (*ProviderPaymentResponse, error) {
 	if m.ShouldTimeout {
 		return nil, ErrProviderTimeout
 	}
 	if m.ShouldFailCreate {
 		return nil, ErrProviderFailure
+	}
+	if m.store != nil {
+		payment, err := m.store.FindByGatewayTransactionID(ctx, providerTransactionID)
+		if errors.Is(err, repository.ErrMockPaymentNotFound) {
+			return nil, ErrProviderPaymentNotFound
+		}
+		if err != nil {
+			return nil, ErrProviderFailure
+		}
+		return &ProviderPaymentResponse{
+			Provider:              mockProviderName,
+			ProviderTransactionID: payment.ProviderTransactionID,
+			Status:                string(payment.Status),
+			PaymentURL:            fmt.Sprintf("%s/pay/%s", m.frontendURL, payment.PublicID),
+			ExpiredAt:             &payment.ExpiredAt,
+		}, nil
 	}
 
 	expiry := m.expiredAt()

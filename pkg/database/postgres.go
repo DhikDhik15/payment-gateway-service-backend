@@ -18,7 +18,9 @@ const (
 
 	// ExpectedMigrationVersion is the minimum clean schema version required
 	// by this release. Future compatible migrations may advance beyond it.
-	ExpectedMigrationVersion = 19
+	// 000022 adds transactions.order_id, which the repository layer selects,
+	// so an older schema cannot serve this binary.
+	ExpectedMigrationVersion = 22
 )
 
 // NewPool creates and validates a new pgxpool connection pool.

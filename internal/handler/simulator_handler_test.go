@@ -113,6 +113,16 @@ func (s *stubSimulatorPaymentSvc) GetPayment(_ context.Context, merchantID, tran
 	return &cp, nil
 }
 
+// GetPaymentDetail mirrors GetPayment without item enrichment: the simulator
+// never serves the product breakdown.
+func (s *stubSimulatorPaymentSvc) GetPaymentDetail(ctx context.Context, merchantID, transactionID uuid.UUID) (*model.DashboardPaymentDetailResponse, error) {
+	payment, err := s.GetPayment(ctx, merchantID, transactionID)
+	if err != nil {
+		return nil, err
+	}
+	return &model.DashboardPaymentDetailResponse{PaymentResponse: *payment}, nil
+}
+
 func (s *stubSimulatorPaymentSvc) CancelPayment(context.Context, uuid.UUID, uuid.UUID) (*model.PaymentResponse, error) {
 	panic("not used in simulator tests")
 }

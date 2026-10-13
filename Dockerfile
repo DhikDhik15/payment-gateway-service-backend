@@ -32,6 +32,11 @@ RUN addgroup -S appgroup && adduser -S appuser -G appgroup
 
 WORKDIR /app
 
+# Persistent product image storage root. The directory itself is empty in the
+# image — docker-compose mounts a named volume here so uploaded product
+# images survive container recreation (the runtime container is read_only).
+RUN mkdir -p /app/storage/product-images && chown -R appuser:appgroup /app/storage
+
 # Copy binary from builder stage.
 COPY --from=builder /app/bin/server .
 

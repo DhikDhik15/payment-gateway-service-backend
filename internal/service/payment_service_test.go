@@ -581,6 +581,7 @@ func TestStateMachine_AllowedTransitions(t *testing.T) {
 		want bool
 	}{
 		{model.TransactionStatusCreated, model.TransactionStatusPending, true},
+		{model.TransactionStatusCreated, model.TransactionStatusFailed, true},
 		{model.TransactionStatusCreated, model.TransactionStatusCancelled, true},
 		{model.TransactionStatusPending, model.TransactionStatusPaid, true},
 		{model.TransactionStatusPending, model.TransactionStatusFailed, true},

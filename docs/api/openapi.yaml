@@ -1,28 +1,37 @@
 openapi: 3.1.0
 info:
-  title: Payment Gateway — External Merchant API
+  title: Payment Gateway — Merchant and Dashboard API
   description: |
-    Merchant-facing API for payment creation, retrieval, cancellation, refunds, and webhook configuration.
+    Merchant API for payments, refunds and webhooks, plus dashboard order creation and retrieval.
 
     ## Authentication
 
-    All requests require an API key sent via the `X-API-Key` header.
-
-    **Compound credential format:** `pk_<hex>:sk_<hex>`
-
-    The API key determines the merchant identity. Clients must never send a `merchant_id` —
-    it is always derived from the authenticated API key.
+    Integration endpoints require the `X-API-Key` header (compound format:
+    `pk_<hex>:sk_<hex>`). Dashboard order endpoints require a dashboard JWT in
+    `Authorization: Bearer <access-token>`; merchant API keys do not authorize them.
+    Merchant identity is derived from the authenticated credential, never from a
+    client-supplied `merchant_id`. Orders belonging to another merchant return 404.
+    Dashboard OWNER and ADMIN users can create orders; VIEWER users can read orders only.
 
     ## Idempotency
 
-    Payment creation and refund creation require an `Idempotency-Key` header (1–255 chars).
-    The key is scoped per merchant. Same key + same payload returns the stored result.
-    Same key + different payload returns `409 IDEMPOTENCY_KEY_REUSED`.
+    Payment and refund creation require an `Idempotency-Key` (1–255 chars), scoped
+    to the merchant. The same key and payload replay the stored result; a changed
+    payload returns `409 IDEMPOTENCY_KEY_REUSED`.
+
+    Dashboard order creation also requires an `Idempotency-Key`, but accepts only
+    1–255 printable ASCII characters without whitespace. Order keys are durable
+    (not subject to the payment/refund idempotency TTL) and scoped to the merchant.
+    An identical set of product IDs and quantities, regardless of item order,
+    replays the original immutable price snapshot with HTTP 200; a different
+    request using the same key returns `409 IDEMPOTENCY_KEY_REUSED`. A concurrent
+    request for the same merchant/key is serialized; it does not create a second
+    order. Use a fresh key for a new order, even if the items are identical.
 
     ## Rate Limiting
 
-    - 120 requests/minute per authenticated merchant
-    - 120 requests/minute per client IP (pre-auth)
+    - Integration API: 120 requests/minute per authenticated merchant
+    - Integration API: 120 requests/minute per client IP (pre-auth)
     - 429 returned when exceeded, with `Retry-After` header
   version: 1.0.0
   contact:
@@ -39,6 +48,12 @@ tags:
     description: Refund operations
   - name: Webhooks
     description: Merchant webhook configuration and delivery inspection
+  - name: Dashboard Orders
+    description: JWT-authenticated, merchant-scoped POS orders (not payments)
+  - name: Dashboard Products
+    description: JWT-authenticated, merchant-scoped product catalog
+  - name: Dashboard Categories
+    description: JWT-authenticated, merchant-scoped product categories
 paths:
   /api/v1/payments:
     get:
@@ -571,6 +586,757 @@ paths:
           $ref: '#/components/responses/NotFoundError'
         '409':
           $ref: '#/components/responses/ConflictError'
+  /api/v1/dashboard/orders:
+    post:
+      tags: [Dashboard Orders]
+      summary: Create an order from product snapshots
+      description: |
+        Requires a dashboard Bearer JWT with OWNER or ADMIN role (VIEWER gets 403).
+        The merchant is derived from the authenticated dashboard user, not the body.
+        Supply only product IDs and quantities; unknown fields, duplicate product IDs,
+        inactive or other merchants' products are rejected. Product name, unit price
+        and currency are read from the merchant's active catalog and saved as immutable
+        snapshots. All products must use the same currency. Subtotal and total_amount
+        are integer minor units; total_amount equals subtotal (no tax, discounts, fees
+        or currency conversion). This creates an order only, not a payment.
+
+        **Durable idempotency:** The required merchant-scoped Idempotency-Key is
+        1–255 printable ASCII characters without whitespace. Requests with the same
+        key and equivalent item sets (item order ignored) return the original order
+        and its original snapshots with HTTP 200. A different item set returns
+        409 IDEMPOTENCY_KEY_REUSED. Concurrent same-key requests serialize. Order
+        keys do not expire with the payment/refund idempotency TTL.
+      operationId: createDashboardOrder
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/OrderIdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOrderRequest'
+            example:
+              items:
+                - product_id: 5fcaf6af-ea8f-4328-866e-168d07e7c9a0
+                  quantity: 2
+      responses:
+        '201':
+          $ref: '#/components/responses/OrderCreatedResponse'
+        '200':
+          $ref: '#/components/responses/OrderReplayedResponse'
+        '400':
+          $ref: '#/components/responses/OrderCreateError'
+        '401':
+          $ref: '#/components/responses/DashboardUnauthorizedError'
+        '403':
+          $ref: '#/components/responses/DashboardRoleError'
+        '409':
+          $ref: '#/components/responses/OrderIdempotencyConflict'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    get:
+      tags: [Dashboard Orders]
+      summary: List orders
+      description: |
+        Lists orders owned by the authenticated merchant, newest first by
+        created_at DESC, id DESC. All dashboard roles can read. Each order
+        includes its saved item snapshots, even if the product was later deleted.
+      operationId: listDashboardOrders
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+      responses:
+        '200':
+          $ref: '#/components/responses/OrderListResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/DashboardUnauthorizedError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  /api/v1/dashboard/orders/{order_id}:
+    get:
+      tags: [Dashboard Orders]
+      summary: Get an order
+      description: |
+        Returns an order and its immutable item snapshots. All dashboard roles
+        can read. Missing and cross-merchant order IDs both return 404.
+      operationId: getDashboardOrder
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/OrderIdParam'
+      responses:
+        '200':
+          $ref: '#/components/responses/OrderDetailResponse'
+        '400':
+          description: Invalid order UUID (INVALID_REQUEST)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/DashboardUnauthorizedError'
+        '404':
+          $ref: '#/components/responses/OrderNotFoundError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  /api/v1/dashboard/orders/{order_id}/payments:
+    get:
+      tags: [Dashboard Orders]
+      summary: List payment attempts for an existing order
+      description: |
+        Requires a dashboard Bearer JWT (all roles may read). The order must
+        belong to the authenticated merchant — missing and foreign order IDs
+        both return 404. Returns the recorded payment attempts newest first
+        (created_at DESC, id DESC) as PaymentResponse items, each carrying its
+        transaction_id, order_id, status, method, server-derived amount and
+        currency, and timestamps. Order-backed attempts additionally carry an
+        order_summary (first product names plus line count, from immutable
+        order-item snapshots) for display; it is omitted when unavailable.
+        Strictly read-only: it never creates,
+        mutates, reconciles, simulates, or cancels anything, so it is safe to
+        poll for recovery. An empty array means no attempt exists yet.
+      operationId: listDashboardOrderPayments
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/OrderIdParam'
+      responses:
+        '200':
+          description: Payment attempts, newest first (empty array when none)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, data]
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Payment'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/DashboardUnauthorizedError'
+        '404':
+          $ref: '#/components/responses/OrderNotFoundError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    post:
+      tags: [Dashboard Orders]
+      summary: Initiate a payment for an existing order
+      description: |
+        Requires a dashboard Bearer JWT with OWNER or ADMIN role (VIEWER gets 403).
+        Amount, currency, merchant identity and merchant_order_id are derived
+        server-side from the authenticated order — the body accepts only
+        payment_method, and unknown fields are rejected. The order must belong
+        to the authenticated merchant (otherwise 404) and be in CREATED status.
+
+        **Idempotency:** the merchant-scoped Idempotency-Key is required. Same
+        order + same payment method + same key replays the original result
+        (201 with the original transaction); the same key with a different
+        payment method returns 409 IDEMPOTENCY_KEY_REUSED. Keys expire with the
+        payment idempotency TTL (24h).
+
+        **Retry policy:** one order may have many attempts over its lifetime,
+        but at most one active (CREATED/PENDING) and at most one PAID payment
+        (enforced by partial unique indexes). A new attempt is allowed after
+        FAILED/CANCELLED/EXPIRED and rejected (409) while an attempt is active
+        or already PAID.
+
+        **Ambiguous provider outcome:** a provider timeout that cannot be
+        reconciled via provider lookup leaves the transaction CREATED and
+        returns 504 without starting another attempt; retry only after the
+        outcome resolves. A definitive provider failure marks the transaction
+        FAILED (201→FAILED is a valid CREATED transition) and a retry is allowed.
+
+        Merchant webhooks keep their existing shape and semantics (no order_id
+        is added to the outbound payload — backward compatible); the order link
+        remains available to internal persistence via transactions.order_id.
+      operationId: createDashboardOrderPayment
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/OrderIdParam'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOrderPaymentRequest'
+            example:
+              payment_method: QRIS
+      responses:
+        '201':
+          description: Order payment initiated (CreatePaymentResponse, includes order_id)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreatePaymentResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/DashboardUnauthorizedError'
+        '403':
+          $ref: '#/components/responses/DashboardRoleError'
+        '404':
+          $ref: '#/components/responses/OrderNotFoundError'
+        '409':
+          description: Order not payable, duplicate active/paid payment, or idempotency conflict
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '502':
+          description: Definitive provider failure (payment recorded as FAILED)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '504':
+          description: Ambiguous provider outcome (transaction stays CREATED, do not blindly retry creation)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /api/v1/dashboard/categories:
+    post:
+      tags: [Dashboard Categories]
+      summary: Create a category
+      description: |
+        Requires a dashboard Bearer JWT with OWNER or ADMIN role (VIEWER gets 403).
+        The merchant is derived from the authenticated dashboard user, not the body.
+        Names are trimmed and must be non-blank (max 100 chars); duplicates are
+        rejected case-insensitively per merchant with 409.
+      operationId: createDashboardCategory
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateCategoryRequest'
+            example:
+              name: Beverages
+      responses:
+        '201':
+          description: Category created
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, data]
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    $ref: '#/components/schemas/Category'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/DashboardUnauthorizedError'
+        '403':
+          $ref: '#/components/responses/DashboardRoleError'
+        '409':
+          $ref: '#/components/responses/CategoryConflictError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    get:
+      tags: [Dashboard Categories]
+      summary: List categories
+      description: |
+        Lists categories owned by the authenticated merchant, ordered by name.
+        All dashboard roles can read. Unpaginated: categories are small
+        admin-managed sets.
+      operationId: listDashboardCategories
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Category list (empty array when none)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, data]
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Category'
+        '401':
+          $ref: '#/components/responses/DashboardUnauthorizedError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  /api/v1/dashboard/categories/{category_id}:
+    get:
+      tags: [Dashboard Categories]
+      summary: Get a category
+      description: |
+        Returns one category owned by the authenticated merchant. Missing and
+        cross-merchant IDs both return 404.
+      operationId: getDashboardCategory
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/CategoryIdParam'
+      responses:
+        '200':
+          description: Category detail
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, data]
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    $ref: '#/components/schemas/Category'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/DashboardUnauthorizedError'
+        '404':
+          $ref: '#/components/responses/CategoryNotFoundError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    patch:
+      tags: [Dashboard Categories]
+      summary: Update a category
+      description: |
+        Requires OWNER or ADMIN role. Only provided fields are updated; a blank
+        name is rejected with 400. Duplicate names conflict with 409.
+      operationId: updateDashboardCategory
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/CategoryIdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateCategoryRequest'
+      responses:
+        '200':
+          description: Updated category
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, data]
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    $ref: '#/components/schemas/Category'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/DashboardUnauthorizedError'
+        '403':
+          $ref: '#/components/responses/DashboardRoleError'
+        '404':
+          $ref: '#/components/responses/CategoryNotFoundError'
+        '409':
+          $ref: '#/components/responses/CategoryConflictError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    delete:
+      tags: [Dashboard Categories]
+      summary: Delete a category
+      description: |
+        Requires OWNER or ADMIN role. Products in the category keep their rows
+        with a nulled category link.
+      operationId: deleteDashboardCategory
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/CategoryIdParam'
+      responses:
+        '200':
+          description: Deletion acknowledgement
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, data]
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    type: object
+                    required: [status]
+                    properties:
+                      status:
+                        type: string
+                        example: deleted
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/DashboardUnauthorizedError'
+        '403':
+          $ref: '#/components/responses/DashboardRoleError'
+        '404':
+          $ref: '#/components/responses/CategoryNotFoundError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  /api/v1/dashboard/products:
+    post:
+      tags: [Dashboard Products]
+      summary: Create a product
+      description: |
+        Requires a dashboard Bearer JWT with OWNER or ADMIN role (VIEWER gets 403).
+        The merchant is derived from the authenticated dashboard user, not the body.
+        Price is integer minor units (≥0); currency must be IDR; an optional
+        category must belong to the same merchant; an optional image_url must be
+        either an HTTPS URL (the backend never fetches it) or a backend-stored
+        reference issued by POST /api/v1/dashboard/product-images. Duplicate SKUs conflict.
+      operationId: createDashboardProduct
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateProductRequest'
+            example:
+              name: Arabica 250g
+              price: 85000
+              currency: IDR
+      responses:
+        '201':
+          description: Product created
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, data]
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    $ref: '#/components/schemas/Product'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/DashboardUnauthorizedError'
+        '403':
+          $ref: '#/components/responses/DashboardRoleError'
+        '404':
+          $ref: '#/components/responses/ProductCategoryNotFoundError'
+        '409':
+          $ref: '#/components/responses/ProductConflictError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    get:
+      tags: [Dashboard Products]
+      summary: List products
+      description: |
+        Lists products owned by the authenticated merchant with optional
+        category, active-status, and free-text filters, paginated newest-active
+        first (active DESC, updated_at DESC, name ASC, id DESC). All dashboard
+        roles can read.
+      operationId: listDashboardProducts
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/CategoryIdQueryParam'
+        - $ref: '#/components/parameters/ActiveQueryParam'
+        - $ref: '#/components/parameters/ProductSearchParam'
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+      responses:
+        '200':
+          $ref: '#/components/responses/ProductListResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/DashboardUnauthorizedError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  /api/v1/dashboard/products/{product_id}:
+    get:
+      tags: [Dashboard Products]
+      summary: Get a product
+      description: |
+        Returns one product owned by the authenticated merchant. Missing and
+        cross-merchant IDs both return 404.
+      operationId: getDashboardProduct
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ProductIdParam'
+      responses:
+        '200':
+          description: Product detail
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, data]
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    $ref: '#/components/schemas/Product'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/DashboardUnauthorizedError'
+        '404':
+          $ref: '#/components/responses/ProductNotFoundError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    patch:
+      tags: [Dashboard Products]
+      summary: Update a product
+      description: |
+        Requires OWNER or ADMIN role. Only provided fields are updated; blank
+        names, negative prices, non-IDR currency, and invalid image URLs are
+        rejected with 400. Accepts HTTPS URLs and backend-stored upload
+        references; PATCH cannot clear an image (use
+        DELETE /api/v1/dashboard/products/{product_id}/image).
+        Existing orders keep their immutable snapshots:
+        price edits never rewrite order history.
+      operationId: updateDashboardProduct
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ProductIdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateProductRequest'
+      responses:
+        '200':
+          description: Updated product
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, data]
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    $ref: '#/components/schemas/Product'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/DashboardUnauthorizedError'
+        '403':
+          $ref: '#/components/responses/DashboardRoleError'
+        '404':
+          $ref: '#/components/responses/ProductNotFoundError'
+        '409':
+          $ref: '#/components/responses/ProductConflictError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    delete:
+      tags: [Dashboard Products]
+      summary: Delete a product
+      description: |
+        Requires OWNER or ADMIN role. Hard delete; existing order item
+        snapshots are preserved with a nulled product link.
+      operationId: deleteDashboardProduct
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ProductIdParam'
+      responses:
+        '200':
+          description: Deletion acknowledgement
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, data]
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    type: object
+                    required: [status]
+                    properties:
+                      status:
+                        type: string
+                        example: deleted
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/DashboardUnauthorizedError'
+        '403':
+          $ref: '#/components/responses/DashboardRoleError'
+        '404':
+          $ref: '#/components/responses/ProductNotFoundError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  /api/v1/dashboard/product-images:
+    post:
+      tags: [Dashboard Products]
+      summary: Upload a product image
+      description: |
+        Requires a dashboard Bearer JWT with OWNER or ADMIN role (VIEWER gets 403).
+        Accepts multipart/form-data with a single `image` field (JPEG, PNG, or
+        WebP; GIF, BMP, and SVG/HTML are rejected). The file is validated by
+        actual decoding (not filename or Content-Type), bounded by
+        PRODUCT_IMAGE_MAX_BYTES / MAX_DIMENSION / MAX_PIXELS, stored under a
+        server-generated UUID filename, and returns a stable `image_url`
+        reference for use in product create/PATCH payloads. The upload alone
+        never modifies any product. The merchant is derived from the
+        authenticated dashboard user, never from the body.
+        NOTE: the global HTTP_MAX_BODY_BYTES limit applies before this handler
+        runs — it must be configured above PRODUCT_IMAGE_MAX_BYTES.
+      operationId: uploadDashboardProductImage
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [image]
+              properties:
+                image:
+                  type: string
+                  format: binary
+                  description: JPEG, PNG, or WebP image file.
+      responses:
+        '201':
+          description: Image uploaded; stable reference returned
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, data]
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    $ref: '#/components/schemas/ProductImageUpload'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/DashboardUnauthorizedError'
+        '403':
+          $ref: '#/components/responses/DashboardRoleError'
+        '413':
+          $ref: '#/components/responses/ProductImageTooLargeError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  /api/v1/dashboard/products/{product_id}/image:
+    delete:
+      tags: [Dashboard Products]
+      summary: Remove a product image
+      description: |
+        Requires OWNER or ADMIN role. Clears the product's image reference
+        (sets image_url to null) and deletes the backing file when it is a
+        backend-stored reference no longer used by any product. External
+        HTTPS references are unlinked without file operations. Missing
+        products, foreign products, and products with no image all return 404.
+      operationId: deleteDashboardProductImage
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ProductIdParam'
+      responses:
+        '200':
+          description: Product with cleared image
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, data]
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    $ref: '#/components/schemas/Product'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/DashboardUnauthorizedError'
+        '403':
+          $ref: '#/components/responses/DashboardRoleError'
+        '404':
+          $ref: '#/components/responses/ProductNotFoundError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  /api/v1/product-images/{merchant_id}/{filename}:
+    get:
+      tags: [Dashboard Products]
+      summary: Serve a product image
+      description: |
+        Public (no authentication — product images are public catalog assets,
+        equivalent to the external HTTPS image_url values they replace).
+        References are server-generated UUID paths. Serves image/jpeg,
+        image/png, or image/webp with `Cache-Control: public, max-age=86400, immutable` and
+        `X-Content-Type-Options: nosniff`. Unknown or malformed references
+        return a bare 404 with no storage detail. Clients resolve stored
+        `image_url` values against the backend API origin.
+      operationId: getProductImage
+      parameters:
+        - name: merchant_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: filename
+          in: path
+          required: true
+          schema:
+            type: string
+            example: 3fa85f64-5717-4562-b3fc-2c963f66afa6.png
+      responses:
+        '200':
+          description: Image bytes
+          content:
+            image/jpeg:
+              schema:
+                type: string
+                format: binary
+            image/png:
+              schema:
+                type: string
+                format: binary
+            image/webp:
+              schema:
+                type: string
+                format: binary
+        '404':
+          description: Unknown or malformed image reference
 components:
   securitySchemes:
     ApiKeyAuth:
@@ -580,7 +1346,28 @@ components:
       description: |
         Merchant API key. Compound format: `pk_<hex>:sk_<hex>`.
         The API key determines the merchant identity — never send a merchant_id.
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Dashboard access token in Authorization: Bearer <access-token>.
+        X-API-Key is not accepted for dashboard order routes. The authenticated
+        dashboard user determines the merchant scope.
   parameters:
+    OrderIdempotencyKeyHeader:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        Durable merchant-scoped order creation key, 1–255 printable ASCII
+        characters without whitespace. Same key and equivalent items replay the
+        original order (200); changed items return 409 IDEMPOTENCY_KEY_REUSED.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 255
+        pattern: '^[!-~]{1,255}$'
     IdempotencyKeyHeader:
       name: Idempotency-Key
       in: header
@@ -590,6 +1377,52 @@ components:
         type: string
         minLength: 1
         maxLength: 255
+    OrderIdParam:
+      name: order_id
+      in: path
+      required: true
+      description: Order UUID
+      schema:
+        type: string
+        format: uuid
+    CategoryIdParam:
+      name: category_id
+      in: path
+      required: true
+      description: Category UUID
+      schema:
+        type: string
+        format: uuid
+    ProductIdParam:
+      name: product_id
+      in: path
+      required: true
+      description: Product UUID
+      schema:
+        type: string
+        format: uuid
+    CategoryIdQueryParam:
+      name: category_id
+      in: query
+      required: false
+      description: Filter products by category UUID
+      schema:
+        type: string
+        format: uuid
+    ActiveQueryParam:
+      name: active
+      in: query
+      required: false
+      description: Filter products by active status
+      schema:
+        type: boolean
+    ProductSearchParam:
+      name: search
+      in: query
+      required: false
+      description: Free-text match against product name, SKU, or description
+      schema:
+        type: string
     PaymentIdParam:
       name: id
       in: path
@@ -697,6 +1530,300 @@ components:
         type: string
         format: date-time
   schemas:
+    CreateOrderRequest:
+      type: object
+      additionalProperties: false
+      required: [items]
+      description: |
+        Select 1–100 distinct merchant products. Do not send merchant_id, prices,
+        currency or product names; all are resolved server-side. Item order does
+        not affect the idempotency hash.
+      properties:
+        items:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/CreateOrderItemRequest'
+    CreateOrderItemRequest:
+      type: object
+      additionalProperties: false
+      required: [product_id, quantity]
+      properties:
+        product_id:
+          type: string
+          format: uuid
+          description: Active product belonging to the authenticated merchant; each ID may occur only once per order.
+        quantity:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 1000
+    OrderStatus:
+      type: string
+      enum: [CREATED]
+      description: Orders have only the CREATED state; payments have a separate lifecycle.
+    CreateOrderPaymentRequest:
+      type: object
+      additionalProperties: false
+      required: [payment_method]
+      description: |
+        Only the payment method is client input. Amount, currency, merchant
+        identity and merchant_order_id are derived server-side from the
+        authenticated order. Unknown fields are rejected.
+      properties:
+        payment_method:
+          type: string
+          enum: [QRIS]
+          description: Payment method (QRIS is currently the only supported value)
+    OrderItem:
+      type: object
+      required: [id, order_id, merchant_id, product_id, product_name, quantity, unit_price, subtotal, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        order_id:
+          type: string
+          format: uuid
+        merchant_id:
+          type: string
+          format: uuid
+        product_id:
+          type: [string, 'null']
+          format: uuid
+          description: Null if the source product was subsequently deleted; the price/name snapshots remain.
+        product_name:
+          type: string
+          description: Name captured at order creation.
+        quantity:
+          type: integer
+          format: int64
+        unit_price:
+          type: integer
+          format: int64
+          description: Product price at order creation in integer minor units.
+        subtotal:
+          type: integer
+          format: int64
+          description: unit_price multiplied by quantity.
+        created_at:
+          type: string
+          format: date-time
+    Order:
+      type: object
+      required: [id, merchant_id, status, currency, subtotal, total_amount, items, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        merchant_id:
+          type: string
+          format: uuid
+          description: Derived from the authenticated dashboard user, never client input.
+        status:
+          $ref: '#/components/schemas/OrderStatus'
+        currency:
+          type: string
+          description: Shared currency of the selected products.
+        subtotal:
+          type: integer
+          format: int64
+          description: Sum of item subtotals in integer minor units.
+        total_amount:
+          type: integer
+          format: int64
+          description: Equals subtotal; no taxes, discounts, fees or FX.
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/OrderItem'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    Category:
+      type: object
+      required: [id, merchant_id, name, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        merchant_id:
+          type: string
+          format: uuid
+          description: Derived from the authenticated dashboard user, never client input.
+        name:
+          type: string
+          maxLength: 100
+        description:
+          type: string
+          maxLength: 500
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    CreateCategoryRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        description:
+          type: string
+          maxLength: 500
+    UpdateCategoryRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        description:
+          type: string
+          maxLength: 500
+    Product:
+      type: object
+      required: [id, merchant_id, name, price, currency, active, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        merchant_id:
+          type: string
+          format: uuid
+          description: Derived from the authenticated dashboard user, never client input.
+        category_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: Null when uncategorized or when the source category was deleted.
+        name:
+          type: string
+          maxLength: 200
+        sku:
+          type: string
+          maxLength: 50
+          nullable: true
+        description:
+          type: string
+          maxLength: 500
+          nullable: true
+        price:
+          type: integer
+          format: int64
+          minimum: 0
+          description: 'Integer minor units (IDR: rupiah). Never floats.'
+        currency:
+          type: string
+          enum: [IDR]
+        image_url:
+          type: string
+          format: uri
+          maxLength: 2048
+          nullable: true
+          description: Optional image reference for storefront display. Either an external absolute HTTPS URL (syntactic validation only — the backend never fetches it) or a backend-stored reference (/api/v1/product-images/<merchant>/<file>) issued by POST /api/v1/dashboard/product-images. Resolve stored references against the backend API origin.
+        active:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    ProductImageUpload:
+      type: object
+      required: [image_url, format, width, height, size_bytes, content_type]
+      properties:
+        image_url:
+          type: string
+          example: /api/v1/product-images/3fa85f64-5717-4562-b3fc-2c963f66afa6/7c9e6679-7425-40de-944b-e07fc1f90ae7.png
+          description: Stable reference to store in product image_url (create/PATCH). Relative to the backend API origin; no filesystem path is exposed.
+        format:
+          type: string
+          enum: [jpeg, png, webp]
+        width:
+          type: integer
+          description: Decoded image width in pixels.
+        height:
+          type: integer
+          description: Decoded image height in pixels.
+        size_bytes:
+          type: integer
+          format: int64
+          description: Stored file size in bytes.
+        content_type:
+          type: string
+          enum: [image/jpeg, image/png, image/webp]
+    CreateProductRequest:
+      type: object
+      required: [name, price, currency]
+      properties:
+        category_id:
+          type: string
+          format: uuid
+          description: Optional; must belong to the same merchant.
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        sku:
+          type: string
+          maxLength: 50
+        description:
+          type: string
+          maxLength: 500
+        price:
+          type: integer
+          format: int64
+          minimum: 0
+        currency:
+          type: string
+          enum: [IDR]
+        image_url:
+          type: string
+          maxLength: 2048
+          description: External HTTPS URL or backend-stored upload reference (/api/v1/product-images/...).
+        active:
+          type: boolean
+          description: Defaults to true when omitted.
+    UpdateProductRequest:
+      type: object
+      description: All fields optional; only provided fields change. PATCH cannot clear the image (nil means unchanged).
+      properties:
+        category_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        sku:
+          type: string
+          maxLength: 50
+        description:
+          type: string
+          maxLength: 500
+        price:
+          type: integer
+          format: int64
+          minimum: 0
+        currency:
+          type: string
+          enum: [IDR]
+        image_url:
+          type: string
+          maxLength: 2048
+          description: External HTTPS URL or backend-stored upload reference (/api/v1/product-images/...).
+        active:
+          type: boolean
     CreatePaymentRequest:
       type: object
       required: [merchant_order_id, amount, currency, payment_method]
@@ -725,6 +1852,11 @@ components:
         transaction_id:
           type: string
           format: uuid
+        order_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: Set for order-backed payments (transactions.order_id); absent for legacy payments
         merchant_order_id:
           type: string
         amount:
@@ -758,6 +1890,11 @@ components:
         transaction_id:
           type: string
           format: uuid
+        order_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: Set for order-backed payments; absent for legacy payments
         merchant_order_id:
           type: string
         amount:
@@ -792,6 +1929,67 @@ components:
         updated_at:
           type: string
           format: date-time
+        order_summary:
+          $ref: '#/components/schemas/OrderSummary'
+        order_items:
+          type: array
+          items:
+            $ref: '#/components/schemas/DashboardPaymentOrderItem'
+          description: |
+            Immutable order-item snapshots for the dashboard payment detail
+            response only (omitted on all other payment payloads, and for
+            payments without a linked order or resolvable items). Product
+            subtotal is the sum of item subtotals; it may differ from the
+            authoritative payment amount, which must always be read from
+            `amount`.
+    DashboardPaymentOrderItem:
+      type: object
+      required: [product_name, unit_price, quantity, subtotal]
+      description: |
+        One purchased line as recorded at order creation time. Values are
+        historical snapshots — never live catalog prices. All amounts are
+        integer minor units; subtotal is the stored unit_price × quantity.
+      properties:
+        product_name:
+          type: string
+          description: Product name captured at order creation.
+        unit_price:
+          type: integer
+          format: int64
+          description: Product price at order creation in integer minor units.
+        quantity:
+          type: integer
+          format: int64
+        subtotal:
+          type: integer
+          format: int64
+          description: Stored unit_price multiplied by quantity.
+      example:
+        product_name: Kopi Arabika
+        unit_price: 35000
+        quantity: 2
+        subtotal: 70000
+    OrderSummary:
+      type: object
+      nullable: true
+      description: |
+        Optional product makeup of the transaction's linked order, built from
+        immutable order_items snapshots taken at purchase time (never the live
+        catalog). Omitted for transactions without a linked order or without
+        usable product names; clients must fall back to merchant_order_id.
+      properties:
+        product_names:
+          type: array
+          maxItems: 2
+          items:
+            type: string
+          description: First product names in stable order-item order
+        product_count:
+          type: integer
+          description: Number of distinct product lines with a usable name
+      example:
+        product_names: [Mechanical Keyboard, Mouse]
+        product_count: 3
     PaymentStatus:
       type: string
       enum: [CREATED, PENDING, PAID, FAILED, EXPIRED, CANCELLED]
@@ -1181,6 +2379,243 @@ components:
             total_pages:
               type: integer
   responses:
+    OrderCreatedResponse:
+      description: New order created; no payment was created
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [success, data, meta]
+            properties:
+              success:
+                type: boolean
+                const: true
+              data:
+                $ref: '#/components/schemas/Order'
+              meta:
+                $ref: '#/components/schemas/Meta'
+    OrderReplayedResponse:
+      description: Existing order replayed for an equivalent request with the same merchant/key; prices are the original snapshots
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [success, data, meta]
+            properties:
+              success:
+                type: boolean
+                const: true
+              data:
+                $ref: '#/components/schemas/Order'
+              meta:
+                $ref: '#/components/schemas/Meta'
+    OrderDetailResponse:
+      description: Order found
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [success, data, meta]
+            properties:
+              success:
+                type: boolean
+                const: true
+              data:
+                $ref: '#/components/schemas/Order'
+              meta:
+                $ref: '#/components/schemas/Meta'
+    OrderListResponse:
+      description: Paginated merchant order list (empty merchants receive an empty array)
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [success, data, meta]
+            properties:
+              success:
+                type: boolean
+                const: true
+              data:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Order'
+              meta:
+                $ref: '#/components/schemas/ListMeta'
+    ProductListResponse:
+      description: Paginated merchant product list (empty merchants receive an empty array)
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [success, data, meta]
+            properties:
+              success:
+                type: boolean
+                const: true
+              data:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Product'
+              meta:
+                $ref: '#/components/schemas/ListMeta'
+    OrderCreateError:
+      description: |
+        Invalid request or key (VALIDATION_ERROR), product not found or inactive
+        (INVALID_REQUEST), mixed product currencies (INVALID_CURRENCY), or
+        amount overflow (INVALID_AMOUNT).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            invalidKey:
+              value:
+                success: false
+                error:
+                  code: VALIDATION_ERROR
+                  message: Validation failed
+                  details:
+                    idempotency_key: Must contain 1-255 printable ASCII characters without surrounding whitespace
+                meta:
+                  request_id: req_xxx
+            unavailableProduct:
+              value:
+                success: false
+                error:
+                  code: INVALID_REQUEST
+                  message: Product not found or inactive
+                meta:
+                  request_id: req_xxx
+    DashboardUnauthorizedError:
+      description: Missing or invalid dashboard Bearer access token, disabled user or inactive merchant
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            success: false
+            error:
+              code: INVALID_CREDENTIALS
+              message: Authentication required
+            meta:
+              request_id: req_xxx
+    OrderIdempotencyConflict:
+      description: Order Idempotency-Key already used with a different item set
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            success: false
+            error:
+              code: IDEMPOTENCY_KEY_REUSED
+              message: Idempotency-Key was used with a different request
+            meta:
+              request_id: req_xxx
+    OrderNotFoundError:
+      description: Order not found or belongs to another merchant
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            success: false
+            error:
+              code: RESOURCE_NOT_FOUND
+              message: Order not found
+            meta:
+              request_id: req_xxx
+    ProductNotFoundError:
+      description: Product not found or belongs to another merchant
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            success: false
+            error:
+              code: RESOURCE_NOT_FOUND
+              message: Product not found
+            meta:
+              request_id: req_xxx
+    CategoryNotFoundError:
+      description: Category not found or belongs to another merchant
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            success: false
+            error:
+              code: RESOURCE_NOT_FOUND
+              message: Category not found
+            meta:
+              request_id: req_xxx
+    ProductConflictError:
+      description: Duplicate product SKU within the merchant catalog
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            success: false
+            error:
+              code: DUPLICATE_MERCHANT_CODE
+              message: SKU already exists
+            meta:
+              request_id: req_xxx
+    ProductImageTooLargeError:
+      description: Uploaded image exceeds PRODUCT_IMAGE_MAX_BYTES (or the global HTTP_MAX_BODY_BYTES limit, which applies first)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            success: false
+            error:
+              code: REQUEST_TOO_LARGE
+              message: Image exceeds the maximum upload size
+            meta:
+              request_id: req_xxx
+    CategoryConflictError:
+      description: Duplicate category name within the merchant catalog
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            success: false
+            error:
+              code: DUPLICATE_MERCHANT_CODE
+              message: Category name already exists
+            meta:
+              request_id: req_xxx
+    ProductCategoryNotFoundError:
+      description: Referenced category missing or belongs to another merchant
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            success: false
+            error:
+              code: RESOURCE_NOT_FOUND
+              message: Category not found
+            meta:
+              request_id: req_xxx
+    DashboardRoleError:
+      description: The dashboard user does not have OWNER or ADMIN role
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            success: false
+            error:
+              code: INSUFFICIENT_ROLE
+              message: Insufficient permissions for this operation
+            meta:
+              request_id: req_xxx
     PaymentCreatedResponse:
       description: Payment created (or replayed)
       content:

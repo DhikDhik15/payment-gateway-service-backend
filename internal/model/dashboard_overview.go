@@ -55,6 +55,20 @@ type DashboardRefundStats struct {
 type DashboardPaymentDetailResponse struct {
 	PaymentResponse
 	Timeline []DashboardTimelineEvent `json:"timeline"`
+	// OrderItems carries the immutable order-item snapshots (name, unit price,
+	// quantity, stored subtotal) for order-backed payments, in canonical item
+	// order. Omitted for payments without a linked order or resolvable items.
+	OrderItems []DashboardPaymentOrderItem `json:"order_items,omitempty"`
+}
+
+// DashboardPaymentOrderItem is a single purchased line as recorded at order
+// creation time. Values are historical snapshots — never live catalog prices.
+// All amounts are integer minor units.
+type DashboardPaymentOrderItem struct {
+	ProductName string `json:"product_name"`
+	UnitPrice   int64  `json:"unit_price"`
+	Quantity    int64  `json:"quantity"`
+	Subtotal    int64  `json:"subtotal"`
 }
 
 // DashboardTimelineEvent is derived only from persisted timestamps — never fabricated.

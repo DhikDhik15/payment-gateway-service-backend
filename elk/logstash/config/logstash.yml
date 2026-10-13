@@ -1,0 +1,12 @@
+# Logstash node settings (development).
+#
+# allow_superuser is required because this container runs as root (user: "0:0")
+# so it can read Docker container log files under /var/lib/docker/containers.
+# Dev-only: do not run Logstash as root in production; ship logs via a
+# least-privilege mechanism instead.
+allow_superuser: true
+# The file input tails every container log on the host, including Logstash's
+# own. Raising the internal log level to error keeps routine parse rejections
+# (handled and dropped by the pipeline) from re-entering the input as new
+# log lines.
+log.level: error

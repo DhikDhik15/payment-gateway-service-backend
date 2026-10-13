@@ -75,7 +75,7 @@ func (p *MidtransProvider) GetPayment(ctx context.Context, id string) (*Provider
 	if err := p.do(ctx, http.MethodGet, "/v2/"+url.PathEscape(id)+"/status", nil, &out); err != nil {
 		return nil, err
 	}
-	return &ProviderPaymentResponse{Provider: p.Name(), ProviderTransactionID: out.TransactionID, Status: out.TransactionStatus}, nil
+	return &ProviderPaymentResponse{Provider: p.Name(), ProviderTransactionID: out.OrderID, Status: out.TransactionStatus, PaymentURL: out.RedirectURL}, nil
 }
 func (p *MidtransProvider) CancelPayment(ctx context.Context, id string) error {
 	var out midtransResponse
@@ -112,6 +112,9 @@ func (p *MidtransProvider) do(ctx context.Context, method, path string, in, out 
 		return ErrProviderFailure
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if resp.StatusCode == http.StatusNotFound {
+			return ErrProviderPaymentNotFound
+		}
 		return ErrProviderFailure
 	}
 	if out != nil && json.Unmarshal(body, out) != nil {

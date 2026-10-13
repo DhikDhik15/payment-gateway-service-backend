@@ -38,3 +38,11 @@ func PaymentRequestHash(req CreatePaymentRequest) string {
 	canonical := fmt.Sprintf("merchant_order_id=%d:%s|amount=%d|currency=%d:%s|payment_method=%d:%s", len(req.MerchantOrderID), req.MerchantOrderID, req.Amount, len(req.Currency), req.Currency, len(req.PaymentMethod), req.PaymentMethod)
 	return fmt.Sprintf("%x", sha256.Sum256([]byte(canonical)))
 }
+
+// OrderPaymentRequestHash binds retries to the merchant, immutable Order,
+// selected method, and server-derived payment values.
+func OrderPaymentRequestHash(merchantID, orderID uuid.UUID, req CreatePaymentRequest) string {
+	canonical := fmt.Sprintf("merchant=%s|order=%s|amount=%d|currency=%d:%s|payment_method=%d:%s",
+		merchantID, orderID, req.Amount, len(req.Currency), req.Currency, len(req.PaymentMethod), req.PaymentMethod)
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(canonical)))
+}

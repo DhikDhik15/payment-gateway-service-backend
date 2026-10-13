@@ -7,8 +7,19 @@ services:
 
     environment:
       - discovery.type=single-node
-      - xpack.security.enabled=false
+      - xpack.security.enabled=true
       - xpack.security.enrollment.enabled=false
+      - xpack.security.http.ssl.enabled=true
+      - xpack.security.http.ssl.key=/usr/share/elasticsearch/config/certs/elasticsearch/elasticsearch.key
+      - xpack.security.http.ssl.certificate=/usr/share/elasticsearch/config/certs/elasticsearch/elasticsearch.crt
+      - xpack.security.http.ssl.certificate_authorities=/usr/share/elasticsearch/config/certs/ca/ca.crt
+      - xpack.security.http.ssl.client_authentication=none
+      - xpack.security.http.ssl.verification_mode=certificate
+      - xpack.security.transport.ssl.enabled=true
+      - xpack.security.transport.ssl.key=/usr/share/elasticsearch/config/certs/elasticsearch/elasticsearch.key
+      - xpack.security.transport.ssl.certificate=/usr/share/elasticsearch/config/certs/elasticsearch/elasticsearch.crt
+      - xpack.security.transport.ssl.certificate_authorities=/usr/share/elasticsearch/config/certs/ca/ca.crt
+      - xpack.security.transport.ssl.verification_mode=certificate
       - ES_JAVA_OPTS=-Xms512m -Xmx512m
 
     ports:
@@ -16,6 +27,10 @@ services:
 
     volumes:
       - elasticsearch-data:/usr/share/elasticsearch/data
+      - ./elk/elasticsearch/elasticsearch.yml:/usr/share/elasticsearch/config/elasticsearch.yml:ro
+      - ./elk/certs/ca/ca.crt:/usr/share/elasticsearch/config/certs/ca/ca.crt:ro
+      - ./elk/certs/elasticsearch/elasticsearch.crt:/usr/share/elasticsearch/config/certs/elasticsearch/elasticsearch.crt:ro
+      - ./elk/certs/elasticsearch/elasticsearch.key:/usr/share/elasticsearch/config/certs/elasticsearch/elasticsearch.key:ro
 
     networks:
       - pay-gate-net
@@ -29,9 +44,14 @@ services:
     ports:
       - "5000:5000"
 
+    env_file:
+      - .env.elk
+
     volumes:
       - ./elk/logstash/pipeline:/usr/share/logstash/pipeline:ro
+      - ./elk/logstash/config/logstash.yml:/usr/share/logstash/config/logstash.yml:ro
       - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - ./elk/certs/ca/ca.crt:/usr/share/logstash/config/certs/ca.crt:ro
 
     depends_on:
       - elasticsearch
@@ -48,7 +68,15 @@ services:
       - "5601:5601"
 
     environment:
-      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      - ELASTICSEARCH_HOSTS=https://elasticsearch:9200
+      - ELASTICSEARCH_SSL_VERIFICATIONMODE=full
+      - ELASTICSEARCH_SSL_CERTIFICATEAUTHORITIES=/usr/share/kibana/config/certs/ca.crt
+
+    env_file:
+      - .env.elk
+
+    volumes:
+      - ./elk/certs/ca/ca.crt:/usr/share/kibana/config/certs/ca.crt:ro
 
     depends_on:
       - elasticsearch
