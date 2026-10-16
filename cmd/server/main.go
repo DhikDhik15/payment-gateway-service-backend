@@ -91,6 +91,16 @@ func main() {
 		)
 	}
 
+	// Development-only account recovery: make the position explicit at
+	// startup (the key itself is never logged). Enabled only in development
+	// with loopback binding; production config validation rejects it.
+	if cfg.DevRecovery.Enabled {
+		slog.Info("development account recovery ENABLED — local use only, never enable in production",
+			slog.String("env", cfg.App.Env),
+			slog.String("bind_host", cfg.App.BindHost),
+		)
+	}
+
 	// -------------------------------------------------------------------------
 	// Database
 	// -------------------------------------------------------------------------
@@ -326,6 +336,30 @@ func main() {
 		cfg.Auth.InvitationTokenTTL,
 		cfg.App.DashboardBaseURL,
 	)
+	// Phase 8E: forgot-password flow. Reset emails are rendered and committed
+	// into email_outbox atomically with the token; the reset link is built
+	// from DASHBOARD_BASE_URL. Like invitations, SMTP stays out of the
+	// request path — delivery is asynchronous via the outbox worker.
+	passwordResetRepo := repository.NewPasswordResetRepository(pool, emailOutboxRepo)
+	passwordResetSvc := service.NewPasswordResetService(
+		merchantUserRepo,
+		merchantRepo,
+		passwordResetRepo,
+		cfg.Auth.PasswordResetTTL,
+		cfg.App.DashboardBaseURL,
+	)
+	// Development-only account recovery (no SMTP). Disabled by default;
+	// config.Load rejects enabling it outside development (never production)
+	// and requires loopback binding. The service re-checks enabled/production
+	// on every call (defense in depth).
+	devRecoverySvc := service.NewDevRecoveryService(
+		merchantUserRepo,
+		merchantRepo,
+		dashboardSessionRepo,
+		cfg.DevRecovery.Enabled,
+		cfg.DevRecovery.Key,
+		cfg.App.Env,
+	)
 	onboardingSvc := service.NewOnboardingService(
 		service.NewPGOnboardingProvisioner(pool, merchantRepo, merchantUserRepo, apiKeyRepo, auditSvc),
 	)
@@ -333,6 +367,9 @@ func main() {
 	// Phase 9: dashboard overview aggregates.
 	dashboardOverviewRepo := repository.NewDashboardOverviewRepository(pool)
 	dashboardOverviewSvc := service.NewDashboardOverviewService(dashboardOverviewRepo, paymentSvc)
+	// Phase 10L: dashboard analytics aggregates (revenue trend, product sales).
+	dashboardAnalyticsRepo := repository.NewDashboardAnalyticsRepository(pool)
+	dashboardAnalyticsSvc := service.NewDashboardAnalyticsService(dashboardAnalyticsRepo)
 	categoryRepo := repository.NewCategoryRepository(pool)
 	productRepo := repository.NewProductRepository(pool)
 	categorySvc := service.NewCategoryService(categoryRepo)
@@ -384,8 +421,15 @@ func main() {
 	// Phase 8B: team invitation handler (create is dashboard-auth; get/accept
 	// are unauthenticated token endpoints).
 	invitationHandler := handler.NewInvitationHandler(invitationSvc)
+	// Phase 8E: forgot-password handler (public request/confirm endpoints).
+	passwordResetHandler := handler.NewPasswordResetHandler(passwordResetSvc)
+	// Development-only account recovery handler (status is public capability
+	// signal; recover requires the X-Dev-Recovery-Key header and is 404
+	// unless explicitly enabled in development).
+	devRecoveryHandler := handler.NewDevRecoveryHandler(devRecoverySvc)
 	// Phase 9: dashboard resource handlers (Bearer JWT only).
 	dashboardOverviewHandler := handler.NewDashboardOverviewHandler(dashboardOverviewSvc)
+	dashboardAnalyticsHandler := handler.NewDashboardAnalyticsHandler(dashboardAnalyticsSvc)
 	dashboardCategoryHandler := handler.NewDashboardCategoryHandler(categorySvc)
 	dashboardProductHandler := handler.NewDashboardProductHandler(productSvc)
 	dashboardProductImageHandler := handler.NewDashboardProductImageHandler(productImageSvc, service.ProductImageConfig{
@@ -628,6 +672,30 @@ func main() {
 			invitations.POST("/:token/accept", invitationHandler.Accept)
 		}
 
+		// Phase 8E: forgot-password — unauthenticated (the requester proves
+		// mailbox ownership, not a session). The request endpoint reuses the
+		// login limiter: it carries an email field, so both the per-IP and
+		// per-account buckets apply. The confirm endpoint carries only an
+		// opaque token, so it gets an IP-scoped budget on the same limiter.
+		auth.POST("/password-reset/request", rateLimitLogin, passwordResetHandler.RequestReset)
+		auth.POST("/password-reset/confirm",
+			middleware.ClientIPRateLimit(loginLimiter, rateWindow, "password-reset"),
+			passwordResetHandler.ConfirmReset,
+		)
+
+		// Development-only account recovery (no SMTP delivery). The status
+		// endpoint is an unauthenticated capability signal (no secrets); the
+		// recover endpoint requires the X-Dev-Recovery-Key header, reuses the
+		// login limiter (per-IP + per-account buckets via the email field),
+		// and is 404 unless explicitly enabled in development. Production
+		// config validation rejects enabling it, and the service re-checks on
+		// every call.
+		auth.GET("/dev-recovery/status",
+			middleware.ClientIPRateLimit(loginLimiter, rateWindow, "dev-recovery"),
+			devRecoveryHandler.Status,
+		)
+		auth.POST("/dev-recovery/recover", rateLimitLogin, devRecoveryHandler.Recover)
+
 		// Phase 8+9: authenticated dashboard endpoints (Bearer JWT only).
 		// Merchant identity is always derived from the authenticated user — never from client input.
 		dashboard := v1.Group("/dashboard")
@@ -716,6 +784,8 @@ func main() {
 
 			// Phase 9: overview + payments (all roles: OWNER, ADMIN, VIEWER).
 			dashboard.GET("/overview", dashboardOverviewHandler.GetOverview)
+			// Phase 10L: analytics (all roles: OWNER, ADMIN, VIEWER).
+			dashboard.GET("/analytics", dashboardAnalyticsHandler.GetAnalytics)
 			dashboard.GET("/payments", dashboardPaymentHandler.ListPayments)
 			dashboard.POST("/payments",
 				middleware.RequireRole(model.DashboardUserRoleOwner, model.DashboardUserRoleAdmin),
@@ -877,7 +947,7 @@ func main() {
 		)
 	}
 
-	srv := newHTTPServer(fmt.Sprintf(":%s", cfg.App.Port), r, cfg.HTTP)
+	srv := newHTTPServer(config.BuildListenAddr(cfg.App.BindHost, cfg.App.Port), r, cfg.HTTP)
 
 	serverErrCh := make(chan error, 1)
 	go func() {

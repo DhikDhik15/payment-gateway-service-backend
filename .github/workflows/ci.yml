@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ── Go toolchain validation ──────────────────────────────────────────────
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify gofmt formatting
+        run: gofmt -l .
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Run unit tests (no external services)
+        run: go test -race -count=1 ./...
+
+      - name: Build server binary
+        run: go build -ldflags="-w -s" -o bin/server ./cmd/server
+
+  # ── Docker image build validation ────────────────────────────────────────
+  # Builds the image to confirm the Dockerfile and context are valid.
+  # No secrets, no registry push, no deployment.
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate Docker Compose model
+        run: docker compose -f docker-compose.yml config --quiet
+
+      - name: Build application image
+        run: docker compose -f docker-compose.yml build app

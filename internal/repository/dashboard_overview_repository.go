@@ -80,6 +80,9 @@ func (r *pgDashboardOverviewRepository) CountPaymentsByStatus(
 	if err := rows.Err(); err != nil {
 		return model.DashboardPaymentStats{}, fmt.Errorf("overview count payments rows: %w", err)
 	}
+	// Terminal unsuccessful payments: failed, expired, and cancelled.
+	// Pending/created are still in flight; paid is the only success state.
+	stats.UnsuccessfulTransactions = stats.Failed + stats.Expired + stats.Cancelled
 	return stats, nil
 }
 

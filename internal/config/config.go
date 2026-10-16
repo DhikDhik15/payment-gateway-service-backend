@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/url"
 	"os"
 	"strconv"
@@ -32,6 +33,7 @@ type Config struct {
 	RateLimit       RateLimitConfig
 	HTTP            HTTPConfig
 	ProductImage    ProductImageConfig
+	DevRecovery     DevRecoveryConfig
 }
 
 // AuthConfig holds configuration for Phase 8 dashboard JWT authentication.
@@ -40,6 +42,7 @@ type AuthConfig struct {
 	AccessTokenTTL     time.Duration
 	RefreshTokenTTL    time.Duration
 	InvitationTokenTTL time.Duration // Phase 8B: team invitation token validity
+	PasswordResetTTL   time.Duration // Phase 8E: password-reset token validity (short)
 	CORSAllowedOrigins string
 }
 
@@ -144,11 +147,34 @@ type HTTPConfig struct {
 // handler runs, so operators must set HTTP_MAX_BODY_BYTES comfortably above
 // PRODUCT_IMAGE_MAX_BYTES (multipart framing overhead) or large uploads are
 // rejected with 413 before validation.
+//
+// Every value must be strictly positive when set: a zero or negative value is
+// rejected at startup so a typo can never silently disable the protection.
 type ProductImageConfig struct {
 	Dir          string // PRODUCT_IMAGE_DIR (default ./storage/product-images)
 	MaxBytes     int64  // PRODUCT_IMAGE_MAX_BYTES (default 5242880 = 5 MiB)
 	MaxDimension int    // PRODUCT_IMAGE_MAX_DIMENSION (default 4096 px per side)
 	MaxPixels    int64  // PRODUCT_IMAGE_MAX_PIXELS (default 16777216)
+}
+
+// DevRecoveryConfig controls the development-only account recovery mechanism
+// (local password reset without SMTP delivery).
+//
+// Fail-closed contract:
+//   - Enabled defaults to FALSE: an operator must explicitly opt in via
+//     DEV_RECOVERY_ENABLED=true.
+//   - Enabled is accepted ONLY when APP_ENV=development (the explicitly
+//     supported development environment). Load rejects true in production
+//     (and in any other non-development environment, including test) so the
+//     recovery endpoint can never run in production.
+//   - When enabled, DEV_RECOVERY_KEY is required (no default, never
+//     hardcoded, never committed) and APP_BIND_HOST must be 127.0.0.1 so the
+//     local backend only listens on loopback.
+//   - The key is configuration, never a frontend input: frontend code must
+//     never contain or persist it.
+type DevRecoveryConfig struct {
+	Enabled bool   // DEV_RECOVERY_ENABLED (default false)
+	Key     string // DEV_RECOVERY_KEY — required when enabled, min 32 chars
 }
 
 // WebhookDeliveryConfig controls outbound merchant webhook delivery (Phase 6).
@@ -185,6 +211,12 @@ type AppConfig struct {
 	Name string
 	Env  string
 	Port string
+	// BindHost (APP_BIND_HOST) is the optional interface the HTTP server
+	// binds to. Empty (unset) preserves the historical behaviour of binding
+	// to all interfaces (":port"); set to 127.0.0.1 to bind localhost only
+	// for local disposable test servers. The port always comes from
+	// APP_PORT — never hardcode it here.
+	BindHost string
 	// SimulatorEnabled controls the /api/v1/simulator routes. It defaults to
 	// FALSE (fail closed): an operator must explicitly opt in via
 	// PAYMENT_SIMULATOR_ENABLED=true, and Load rejects true when
@@ -288,6 +320,12 @@ func Load() (*Config, error) {
 	appPort, err := strconv.Atoi(strings.TrimSpace(getEnv("APP_PORT", "8080")))
 	if err != nil || appPort < 1 || appPort > 65535 {
 		return nil, fmt.Errorf("invalid APP_PORT: must be an integer from 1 to 65535")
+	}
+	// Optional bind interface (APP_BIND_HOST). Empty preserves the historical
+	// ":port" (all interfaces) behaviour; 127.0.0.1 restricts to localhost.
+	bindHost, err := parseBindHost()
+	if err != nil {
+		return nil, err
 	}
 	appEnv, err := parseAppEnv()
 	if err != nil {
@@ -426,6 +464,11 @@ func Load() (*Config, error) {
 	if err != nil || invitationTokenTTL <= 0 {
 		return nil, fmt.Errorf("invalid INVITATION_TOKEN_TTL")
 	}
+	// Phase 8E: password-reset token validity — short by design; default 1h.
+	passwordResetTTL, err := time.ParseDuration(getEnv("PASSWORD_RESET_TOKEN_TTL", "1h"))
+	if err != nil || passwordResetTTL <= 0 {
+		return nil, fmt.Errorf("invalid PASSWORD_RESET_TOKEN_TTL")
+	}
 	corsAllowedOrigins, err := parseCORSAllowedOrigins(appEnv, getEnv("CORS_ALLOWED_ORIGINS", ""))
 	if err != nil {
 		return nil, err
@@ -528,6 +571,14 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 
+	// ── Development-only account recovery (no SMTP) ──────────────────────
+	// Fail closed: disabled by default; enabled only in development with an
+	// explicit key and loopback binding. Production rejects it at startup.
+	devRecoveryCfg, err := parseDevRecoveryConfig(appEnv, bindHost)
+	if err != nil {
+		return nil, err
+	}
+
 	// ── Phase 8D.2: trusted reverse proxies (ClientIP / X-Forwarded-For) ──
 	trustedProxies, err := parseTrustedProxies()
 	if err != nil {
@@ -573,6 +624,7 @@ func Load() (*Config, error) {
 			Name:                        getEnv("APP_NAME", "payment-gateway"),
 			Env:                         appEnv,
 			Port:                        strconv.Itoa(appPort),
+			BindHost:                    bindHost,
 			SimulatorEnabled:            simulatorEnabled,
 			SimulatorMerchantID:         simulatorMerchantID,
 			LegacyAPICredentialsEnabled: legacyAPICredentialsEnabled,
@@ -624,6 +676,7 @@ func Load() (*Config, error) {
 			AccessTokenTTL:     accessTokenTTL,
 			RefreshTokenTTL:    refreshTokenTTL,
 			InvitationTokenTTL: invitationTokenTTL,
+			PasswordResetTTL:   passwordResetTTL,
 			CORSAllowedOrigins: corsAllowedOrigins,
 		},
 		Email:        emailCfg,
@@ -632,6 +685,7 @@ func Load() (*Config, error) {
 		RateLimit:    rateLimitCfg,
 		HTTP:         httpCfg,
 		ProductImage: productImageCfg,
+		DevRecovery:  devRecoveryCfg,
 	}
 
 	return cfg, nil
@@ -955,6 +1009,46 @@ func parseProductImageConfig() (ProductImageConfig, error) {
 	}, nil
 }
 
+// parseDevRecoveryConfig resolves the development-only account recovery
+// settings (DEV_RECOVERY_ENABLED / DEV_RECOVERY_KEY).
+//
+// Fail-closed contract (unit-testable without booting the whole Config):
+//   - unset  → disabled (Enabled=false, Key="").
+//   - true   → allowed ONLY when appEnv == "development". Production (and any
+//     other non-development environment) fails startup so the endpoint can
+//     never run in production.
+//   - when enabled, DEV_RECOVERY_KEY is required, must be at least 32
+//     characters, and has no default — there is deliberately no hardcoded
+//     fallback credential.
+//   - when enabled, bindHost must be exactly "127.0.0.1" so the local backend
+//     only listens on loopback (the existing APP_BIND_HOST mechanism).
+func parseDevRecoveryConfig(appEnv, bindHost string) (DevRecoveryConfig, error) {
+	enabled, err := getEnvBoolStrict("DEV_RECOVERY_ENABLED", false)
+	if err != nil {
+		return DevRecoveryConfig{}, err
+	}
+	if !enabled {
+		return DevRecoveryConfig{}, nil
+	}
+	if appEnv == "production" {
+		return DevRecoveryConfig{}, fmt.Errorf("DEV_RECOVERY_ENABLED=true is not allowed in production (development-only account recovery must never be enabled when APP_ENV=production)")
+	}
+	if appEnv != "development" {
+		return DevRecoveryConfig{}, fmt.Errorf("DEV_RECOVERY_ENABLED=true is allowed only when APP_ENV=development (got %q)", appEnv)
+	}
+	key := strings.TrimSpace(os.Getenv("DEV_RECOVERY_KEY"))
+	if key == "" {
+		return DevRecoveryConfig{}, fmt.Errorf("DEV_RECOVERY_KEY is required when DEV_RECOVERY_ENABLED=true (no default credential; generate with: openssl rand -hex 32)")
+	}
+	if len(key) < 32 {
+		return DevRecoveryConfig{}, fmt.Errorf("DEV_RECOVERY_KEY must be at least 32 characters when DEV_RECOVERY_ENABLED=true")
+	}
+	if bindHost != "127.0.0.1" {
+		return DevRecoveryConfig{}, fmt.Errorf("APP_BIND_HOST=127.0.0.1 is required when DEV_RECOVERY_ENABLED=true (loopback-only binding)")
+	}
+	return DevRecoveryConfig{Enabled: true, Key: key}, nil
+}
+
 // parseTrustedProxies resolves TRUSTED_PROXIES (Phase 8D.2) — the explicit
 // trust policy for X-Forwarded-For (ClientIP) so security-sensitive logic
 // (rate-limit keying) never silently trusts spoofable headers:
@@ -984,6 +1078,41 @@ func parseTrustedProxies() ([]string, error) {
 		return nil, fmt.Errorf("invalid TRUSTED_PROXIES: expected a comma-separated IP/CIDR list or \"none\"")
 	}
 	return out, nil
+}
+
+// parseBindHost resolves APP_BIND_HOST — the optional interface the HTTP
+// server binds to.
+//
+// Contract:
+//   - unset/blank → "" (not configured): callers build ":port", preserving
+//     the historical bind-to-all-interfaces behaviour.
+//   - otherwise   → trimmed bare hostname or IP (e.g. "127.0.0.1").
+//
+// Fail-fast validation rejects values that would build a surprising listen
+// address: whitespace, scheme/path/query fragments, and accidental
+// "host:port" values (the port always comes from APP_PORT). IPv6 literals
+// (which legitimately contain ":") are accepted.
+func parseBindHost() (string, error) {
+	host := strings.TrimSpace(os.Getenv("APP_BIND_HOST"))
+	if host == "" {
+		return "", nil
+	}
+	if strings.Contains(host, "://") || strings.ContainsAny(host, " \t\n\r\f\v/?#@") {
+		return "", fmt.Errorf("invalid APP_BIND_HOST: must be a bare hostname or IP without scheme, path, or whitespace")
+	}
+	if strings.Contains(host, ":") && net.ParseIP(host) == nil {
+		return "", fmt.Errorf("invalid APP_BIND_HOST: must be a bare host without a port (port comes from APP_PORT)")
+	}
+	return host, nil
+}
+
+// BuildListenAddr constructs the http.Server listen address from the
+// configured bind host and port. An empty host preserves the historical
+// ":port" (all interfaces) behaviour; a set host (e.g. "127.0.0.1")
+// restricts the listener to that interface. net.JoinHostPort is used so
+// IPv6 literals are bracketed correctly; no port is ever hardcoded here.
+func BuildListenAddr(host, port string) string {
+	return net.JoinHostPort(strings.TrimSpace(host), strings.TrimSpace(port))
 }
 
 // parseSimulatorMerchantID resolves SIMULATOR_MERCHANT_ID.

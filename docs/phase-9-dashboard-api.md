@@ -112,7 +112,8 @@ Insufficient role → `403 INSUFFICIENT_ROLE`.
     "paid": 0,
     "failed": 0,
     "expired": 0,
-    "cancelled": 0
+    "cancelled": 0,
+    "unsuccessful_transactions": 0
   },
   "revenue": { "amount": 0, "currency": "IDR" },
   "refunds": { "count": 0, "amount": 0, "currency": "IDR" },
@@ -123,9 +124,12 @@ Insufficient role → `403 INSUFFICIENT_ROLE`.
 **Semantics:**
 
 - Payment counts: `transactions` where `created_at ∈ [from, to)`, grouped by status.
+- `payments.unsuccessful_transactions` = `failed + expired + cancelled` for the same window.
 - Revenue (financial truth): `SUM(amount)` where `status = PAID` and `paid_at ∈ [from, to)`.
 - Refunds: SUCCEEDED refunds where `COALESCE(succeeded_at, created_at) ∈ [from, to)`.
-- `recent_payments`: last 10 payments for the merchant (not limited to period).
+- `recent_payments`: last 10 payments **created in the period** (`created_at ∈ [from, to)`),
+  newest first. The list always reflects the selected range; dashboard
+  statistics are never derived from these displayed rows.
   Order-backed items include `order_summary` (see above).
 - Empty merchant → zeros / empty arrays (never fake demo numbers).
 

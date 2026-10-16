@@ -60,10 +60,14 @@ func (s *dashboardOverviewService) GetOverview(
 		return nil, fmt.Errorf("overview refunds: %w", err)
 	}
 
-	// Recent payments: last 10 for this merchant (not limited to period — more useful for ops).
+	// Recent payments: last 10 created inside the reporting period for this
+	// merchant. The list endpoint applies the same half-open [from, to) window
+	// on created_at, so the list stays consistent with the period aggregates.
 	recent, err := s.paymentSvc.ListPayments(ctx, merchantID, model.TransactionListFilter{
-		Page:  1,
-		Limit: 10,
+		Page:        1,
+		Limit:       10,
+		CreatedFrom: &periodFrom,
+		CreatedTo:   &periodTo,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("overview recent payments: %w", err)

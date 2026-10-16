@@ -33,6 +33,9 @@ type DashboardPaymentStats struct {
 	Failed    int64 `json:"failed"`
 	Expired   int64 `json:"expired"`
 	Cancelled int64 `json:"cancelled"`
+	// UnsuccessfulTransactions is the server-computed count of terminal
+	// unsuccessful payments (Failed + Expired + Cancelled) within the period.
+	UnsuccessfulTransactions int64 `json:"unsuccessful_transactions"`
 }
 
 // DashboardRevenueStats is financial truth for the period:

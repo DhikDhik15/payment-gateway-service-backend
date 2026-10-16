@@ -36,6 +36,10 @@ type EmailOutboxType string
 
 const (
 	EmailOutboxTypeInvitation EmailOutboxType = "INVITATION"
+
+	// EmailOutboxTypePasswordReset is the transactional password-reset email
+	// (forgot-password flow). CHECK constraint extended in migration 000025.
+	EmailOutboxTypePasswordReset EmailOutboxType = "PASSWORD_RESET"
 )
 
 // ─── Domain entity ────────────────────────────────────────────────────────────

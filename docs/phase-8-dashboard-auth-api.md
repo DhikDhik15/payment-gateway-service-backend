@@ -195,6 +195,159 @@ Content-Type: application/json
 
 ---
 
+### POST /api/v1/auth/password-reset/request
+
+Request a password-reset email (forgot-password flow, Phase 8E). Public endpoint.
+
+**Request body:**
+```json
+{
+  "email": "owner@example.com"
+}
+```
+
+Always returns the same generic success response, whether or not the email
+belongs to an eligible (ACTIVE user, ACTIVE merchant) account:
+
+```json
+{
+  "success": true,
+  "data": { "message": "If an account exists for this email, a password-reset link has been sent." }
+}
+```
+
+**Security properties:**
+- Opaque 256-bit tokens; only the SHA-256 hash is stored (`password_reset_tokens`).
+- Tokens expire after `PASSWORD_RESET_TOKEN_TTL` (default 1h) and are single-use.
+- At most one PENDING token per user; a new request revokes prior ones.
+- Rate limited per client IP and per submitted account email.
+
+---
+
+### POST /api/v1/auth/password-reset/confirm
+
+Consume a reset token and set a new password (8–128 characters, same policy as
+invitations and password change). Public endpoint. Does not establish a session.
+
+**Request body:**
+```json
+{
+  "token": "<opaque-token-from-email>",
+  "password": "new-strong-password"
+}
+```
+
+**Error responses:**
+
+| Status | Code | Condition |
+|---|---|---|
+| 400 | `RESET_TOKEN_INVALID` | Unknown token |
+| 400 | `VALIDATION_ERROR` | Password policy violation |
+| 409 | `RESET_TOKEN_CONSUMED` | Token already used or revoked |
+| 410 | `RESET_TOKEN_EXPIRED` | Token past expiry |
+
+A successful reset atomically consumes the token, updates the password hash,
+revokes the user's other reset tokens, and deletes the user's refresh sessions
+(previously established sessions cannot refresh afterwards; already-issued
+access JWTs expire naturally — no JWT blacklist by design).
+
+**Local email testing:** with `EMAIL_ENABLED=false` the reset email is queued
+in `email_outbox` (type `PASSWORD_RESET`) but never sent. On a disposable
+database, retrieve the rendered link from the latest outbox row for the
+recipient and open `{DASHBOARD_BASE_URL}/reset-password?token=…` manually.
+With a real SMTP transport configured, delivery is asynchronous via the
+outbox worker with retry/backoff.
+
+**SMTP setup (STARTTLS):** set `EMAIL_ENABLED=true` with `SMTP_HOST`,
+`SMTP_PORT=587`, `SMTP_USERNAME`/`SMTP_PASSWORD`, `SMTP_FROM`, and
+`SMTP_TLS=starttls` (default; the client requires the server to offer
+STARTTLS and validates the server certificate and hostname — it never
+downgrades to cleartext after a TLS failure, and `none` is rejected in
+production). AUTH is attempted only when `SMTP_USERNAME` is set. Port 465
+implicit TLS is supported only via explicit `SMTP_TLS=implicit`. The
+`email_outbox` worker (`EMAIL_WORKER_*`) claims PENDING rows and updates them
+to SENT/retries/DEAD; delivery failures never consume or invalidate reset
+tokens (the token lifecycle commits in its own transaction, independent of
+the email row).
+
+**React implementation note:**
+- Never place the token in logs, analytics, react-query keys, or storage; read
+  it from `?token=` once and scrub it from history (`setSearchParams({}, {replace: true})`)
+- On success, navigate to `/login` with a confirmation message; do not auto-login
+
+---
+
+### GET /api/v1/auth/dev-recovery/status (development only)
+
+Capability signal so the dashboard can decide whether to show development
+recovery controls. Public, unauthenticated, carries no secrets.
+
+**Success response (200):**
+```json
+{
+  "success": true,
+  "data": { "enabled": true },
+  "meta": { "request_id": "req_abc123" }
+}
+```
+
+### POST /api/v1/auth/dev-recovery/recover (development only)
+
+Direct password recovery without SMTP delivery. **Disabled by default;
+`404` unless explicitly enabled with `APP_ENV=development`,
+`DEV_RECOVERY_ENABLED=true`, `DEV_RECOVERY_KEY` (≥ 32 chars), and
+`APP_BIND_HOST=127.0.0.1`. Rejected at startup in production.**
+
+**Request headers:**
+```
+X-Dev-Recovery-Key: <development recovery key>
+Content-Type: application/json
+```
+
+**Request body:**
+```json
+{
+  "email": "owner@example.com",
+  "new_password": "new-strong-password",
+  "confirm_password": "new-strong-password"
+}
+```
+
+- Authorization is the header key only (constant-time compare); an email
+  address alone is never sufficient, and frontend role claims are ignored.
+- Password policy is the existing 8–128 character rule; hashing is Argon2id.
+- Only the identified account is updated; its refresh sessions are revoked.
+- Rate limited per client IP and per submitted account email (login limiter).
+
+**Success response (200):**
+```json
+{
+  "success": true,
+  "data": { "message": "Password has been reset. Sign in with your new password.", "email": "owner@example.com" },
+  "meta": { "request_id": "req_abc123" }
+}
+```
+
+**Error responses:**
+
+| Status | Code | Condition |
+|---|---|---|
+| 400 | `VALIDATION_ERROR` | Missing fields, password policy violation, or confirmation mismatch |
+| 401 | `UNAUTHORIZED` | Missing/wrong recovery key (reveals nothing about accounts) |
+| 404 | `RESOURCE_NOT_FOUND` | Feature disabled (indistinguishable from a missing route) |
+| 404 | `DASHBOARD_USER_NOT_FOUND` | Authorized but unknown/ineligible account |
+| 429 | `RATE_LIMIT_EXCEEDED` | Too many attempts |
+
+**React implementation note (development builds only):**
+- Gate the extra "Development recovery" section on `GET …/status` → `enabled`.
+- Never render it in production builds; frontend visibility is UX only.
+- Collect the key in a password input, keep it in memory only (never
+  localStorage/sessionStorage/cookies/source code/URLs/logs), clear it after
+  the request, and prevent duplicate submissions.
+- Full operator guide: `docs/dev-account-recovery.md`.
+
+---
+
 ### POST /api/v1/admin/merchants/:merchant_id/users
 
 Create a dashboard user. **Admin bootstrap only — requires `X-Admin-Key` header.**

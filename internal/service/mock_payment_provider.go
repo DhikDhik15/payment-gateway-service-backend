@@ -111,11 +111,18 @@ func (m *MockPaymentProvider) GetPayment(ctx context.Context, providerTransactio
 		if err != nil {
 			return nil, ErrProviderFailure
 		}
+		frontendURL := m.frontendURL
+		if frontendURL == "" {
+			// Defensive fallback mirroring CreatePayment: GetPayment must never
+			// emit a path-only URL. config.Load guarantees a configured origin for
+			// server wiring; this guards direct construction with an empty origin.
+			frontendURL = "https://mock-provider.test"
+		}
 		return &ProviderPaymentResponse{
 			Provider:              mockProviderName,
 			ProviderTransactionID: payment.ProviderTransactionID,
 			Status:                string(payment.Status),
-			PaymentURL:            fmt.Sprintf("%s/pay/%s", m.frontendURL, payment.PublicID),
+			PaymentURL:            fmt.Sprintf("%s/pay/%s", frontendURL, payment.PublicID),
 			ExpiredAt:             &payment.ExpiredAt,
 		}, nil
 	}

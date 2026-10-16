@@ -25,10 +25,14 @@ type stubOverviewService struct {
 	resp           *model.DashboardOverviewResponse
 	err            error
 	lastMerchantID uuid.UUID
+	lastFrom       *time.Time
+	lastTo         *time.Time
 }
 
-func (s *stubOverviewService) GetOverview(_ context.Context, merchantID uuid.UUID, _, _ *time.Time) (*model.DashboardOverviewResponse, error) {
+func (s *stubOverviewService) GetOverview(_ context.Context, merchantID uuid.UUID, from, to *time.Time) (*model.DashboardOverviewResponse, error) {
 	s.lastMerchantID = merchantID
+	s.lastFrom = from
+	s.lastTo = to
 	if s.err != nil {
 		return nil, s.err
 	}

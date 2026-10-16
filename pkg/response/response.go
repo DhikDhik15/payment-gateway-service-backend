@@ -112,6 +112,11 @@ const (
 	CodeInvitationAlreadyPending  ErrorCode = "INVITATION_ALREADY_PENDING"
 	CodeInvitationAlreadyAccepted ErrorCode = "INVITATION_ALREADY_ACCEPTED"
 
+	// Password-reset error codes (Phase 8E).
+	CodeResetTokenInvalid  ErrorCode = "RESET_TOKEN_INVALID"
+	CodeResetTokenExpired  ErrorCode = "RESET_TOKEN_EXPIRED"
+	CodeResetTokenConsumed ErrorCode = "RESET_TOKEN_CONSUMED"
+
 	// Outbound webhook destination policy (Phase 8D.2 — SSRF).
 	CodeWebhookDestinationBlocked ErrorCode = "WEBHOOK_DESTINATION_BLOCKED"
 
@@ -266,6 +271,11 @@ func Forbidden(c *gin.Context, code ErrorCode, message string) {
 // NotFound writes HTTP 404.
 func NotFound(c *gin.Context, code ErrorCode, message string) {
 	writeError(c, http.StatusNotFound, code, message, nil)
+}
+
+// Gone writes HTTP 410.
+func Gone(c *gin.Context, code ErrorCode, message string) {
+	writeError(c, http.StatusGone, code, message, nil)
 }
 
 // Conflict writes HTTP 409.

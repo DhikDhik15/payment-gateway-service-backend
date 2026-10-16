@@ -38,8 +38,9 @@ func NewDashboardOverviewHandler(overviewSvc service.DashboardOverviewService) *
 //	@Description
 //	@Description	**Revenue**: SUM(amount) where status=PAID and paid_at ∈ [from, to) — Phase 7A financial truth.
 //	@Description	**Payment counts**: grouped by status where created_at ∈ [from, to).
+//	@Description	`payments.unsuccessful_transactions` = failed + expired + cancelled.
 //	@Description	**Refunds**: SUCCEEDED refunds where COALESCE(succeeded_at, created_at) ∈ [from, to).
-//	@Description	**Recent payments**: last 10 payments for the merchant (not limited to the period).
+//	@Description	**Recent payments**: last 10 payments created in the period (created_at ∈ [from, to)).
 //	@Tags			Dashboard Overview
 //	@Produce		json
 //	@Security		BearerAuth

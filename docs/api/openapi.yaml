@@ -54,7 +54,198 @@ tags:
     description: JWT-authenticated, merchant-scoped product catalog
   - name: Dashboard Categories
     description: JWT-authenticated, merchant-scoped product categories
+  - name: Dashboard Auth
+    description: Public dashboard authentication flows (forgot-password)
 paths:
+  /api/v1/auth/password-reset/request:
+    post:
+      tags: [Dashboard Auth]
+      summary: Request a password reset
+      description: |
+        Sends a single-use password-reset email when the address belongs to an
+        eligible (ACTIVE user, ACTIVE merchant) account. Always returns the same
+        generic response so account existence is never revealed.
+
+        - Reset tokens are opaque 256-bit values; only the SHA-256 hash is stored.
+        - Tokens expire after PASSWORD_RESET_TOKEN_TTL (default 1h) and are single-use.
+        - Rate limited per client IP and per submitted account email.
+      operationId: requestPasswordReset
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RequestPasswordResetRequest'
+      responses:
+        '200':
+          description: Generic response (identical for known and unknown emails)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, data, meta]
+                properties:
+                  success:
+                    type: boolean
+                    const: true
+                  data:
+                    $ref: '#/components/schemas/RequestPasswordResetResponse'
+                  meta:
+                    $ref: '#/components/schemas/Meta'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '429':
+          description: Rate limit exceeded (Retry-After header present)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  /api/v1/auth/password-reset/confirm:
+    post:
+      tags: [Dashboard Auth]
+      summary: Reset the password with a reset token
+      description: |
+        Consumes a single-use reset token and sets a new password (8–128
+        characters). The claim, password update, revocation of other reset
+        tokens, and deletion of the user's refresh sessions commit atomically;
+        concurrent consumes serialize to exactly one winner. Does not establish
+        a session — sign in with the new password afterwards. Rate limited per
+        client IP.
+      operationId: confirmPasswordReset
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConfirmPasswordResetRequest'
+      responses:
+        '200':
+          description: Password reset; no session is established
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, data, meta]
+                properties:
+                  success:
+                    type: boolean
+                    const: true
+                  data:
+                    $ref: '#/components/schemas/ConfirmPasswordResetResponse'
+                  meta:
+                    $ref: '#/components/schemas/Meta'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '409':
+          description: Reset token already consumed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '410':
+          description: Reset token expired
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '429':
+          description: Rate limit exceeded (Retry-After header present)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  /api/v1/auth/dev-recovery/status:
+    get:
+      tags: [Dashboard Auth]
+      summary: Development recovery capability
+      description: |
+        Reports whether development-only account recovery is enabled. Public
+        capability signal for the dashboard (no secrets). Always safe to call.
+      operationId: devRecoveryStatus
+      responses:
+        '200':
+          description: Capability signal (no secrets)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, data, meta]
+                properties:
+                  success:
+                    type: boolean
+                    const: true
+                  data:
+                    $ref: '#/components/schemas/DevRecoveryStatusResponse'
+                  meta:
+                    $ref: '#/components/schemas/Meta'
+  /api/v1/auth/dev-recovery/recover:
+    post:
+      tags: [Dashboard Auth]
+      summary: Recover an account password (development only)
+      description: |
+        Development-only password recovery without SMTP delivery. Disabled by
+        default; 404 unless explicitly enabled with APP_ENV=development,
+        DEV_RECOVERY_ENABLED=true, DEV_RECOVERY_KEY, and APP_BIND_HOST=127.0.0.1.
+        Rejected at startup in production. Requires the X-Dev-Recovery-Key
+        header (never a body/URL field); an email address alone is never
+        sufficient. Updates only the identified account and revokes its refresh
+        sessions. Rate limited per client IP and per submitted account email.
+      operationId: devRecoveryRecover
+      parameters:
+        - in: header
+          name: X-Dev-Recovery-Key
+          required: true
+          schema:
+            type: string
+          description: Development recovery key (per-request header only; never in body, URL, or storage).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DevRecoveryRequest'
+      responses:
+        '200':
+          description: Password updated; sign in with the new password (no session established)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, data, meta]
+                properties:
+                  success:
+                    type: boolean
+                    const: true
+                  data:
+                    $ref: '#/components/schemas/DevRecoveryResponse'
+                  meta:
+                    $ref: '#/components/schemas/Meta'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          description: Missing/wrong recovery key (reveals nothing about accounts)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Feature disabled, or authorized but unknown/ineligible account
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '429':
+          description: Rate limit exceeded (Retry-After header present)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
   /api/v1/payments:
     get:
       tags: [Payments]
@@ -2364,6 +2555,73 @@ components:
       properties:
         request_id:
           type: string
+    RequestPasswordResetRequest:
+      type: object
+      required: [email]
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 254
+    RequestPasswordResetResponse:
+      type: object
+      required: [message]
+      properties:
+        message:
+          type: string
+          example: If an account exists for this email, a password-reset link has been sent.
+    ConfirmPasswordResetRequest:
+      type: object
+      required: [token, password]
+      properties:
+        token:
+          type: string
+          minLength: 16
+          maxLength: 256
+        password:
+          type: string
+          minLength: 8
+          maxLength: 128
+    ConfirmPasswordResetResponse:
+      type: object
+      required: [message]
+      properties:
+        message:
+          type: string
+          example: Your password has been reset. Sign in with your new password.
+    DevRecoveryRequest:
+      type: object
+      required: [email, new_password, confirm_password]
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 254
+        new_password:
+          type: string
+          minLength: 8
+          maxLength: 128
+        confirm_password:
+          type: string
+          minLength: 8
+          maxLength: 128
+    DevRecoveryResponse:
+      type: object
+      required: [message, email]
+      properties:
+        message:
+          type: string
+          example: Password has been reset. Sign in with your new password.
+        email:
+          type: string
+          format: email
+    DevRecoveryStatusResponse:
+      type: object
+      required: [enabled]
+      properties:
+        enabled:
+          type: boolean
+          example: false
     ListMeta:
       allOf:
         - $ref: '#/components/schemas/Meta'
