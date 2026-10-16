@@ -1,0 +1,52 @@
+# docker-compose.stage.yml
+# Isolated local staging environment for GO-SAAS Flutter integration testing (M2A).
+#
+# This Compose project provisions ONLY a PostgreSQL database for staging.
+# The backend is run as a separate host process (see docs/mobile-local-staging-execution.md).
+#
+# All resources are explicitly named with the "go-saas-m2-staging" prefix and
+# belong exclusively to this staging environment. No existing container,
+# network, volume, or database is reused or modified.
+#
+# PostgreSQL security: bound to 127.0.0.1 only (not LAN), on a dedicated
+# bridge network, with a dedicated named volume. read_only/cap_drop restrictions
+# are intentionally NOT applied here because PostgreSQL requires write access
+# to its data directory and socket directory; network isolation provides the
+# security boundary instead.
+#
+# Usage:
+#   docker compose --env-file .env.stage -f docker-compose.stage.yml \
+#       --project-name go-saas-m2-staging up -d
+#
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: go-saas-m2-staging-db
+    restart: "no"
+    init: true
+    ports:
+      - "127.0.0.1:${STAGING_DB_PORT:-55433}:5432"
+    environment:
+      POSTGRES_USER: ${STAGING_DB_USER}
+      POSTGRES_PASSWORD: ${STAGING_DB_PASSWORD}
+      POSTGRES_DB: ${STAGING_DB_NAME}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+    volumes:
+      - go-saas-m2-staging-pgdata:/var/lib/postgresql/data
+    networks:
+      - go-saas-m2-staging-net
+
+networks:
+  go-saas-m2-staging-net:
+    name: go-saas-m2-staging-net
+    driver: bridge
+
+volumes:
+  go-saas-m2-staging-pgdata:
+    name: go-saas-m2-staging-pgdata
+    driver: local
