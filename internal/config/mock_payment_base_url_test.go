@@ -56,6 +56,36 @@ func TestLoad_FrontendPublicURLRejectsInvalidValue(t *testing.T) {
 	}
 }
 
+func TestLoad_FrontendPublicURLRejectsNonHTTPSScheme(t *testing.T) {
+	for _, raw := range []string{
+		"ftp://frontend.example.com",
+		"file://frontend.example.com",
+		"javascript://frontend.example.com",
+	} {
+		t.Run(raw, func(t *testing.T) {
+			baseLoadEnv(t)
+			t.Setenv("FRONTEND_PUBLIC_URL", raw)
+
+			if _, err := Load(); err == nil {
+				t.Fatalf("Load() accepted non-HTTP(S) FRONTEND_PUBLIC_URL %q", raw)
+			}
+		})
+	}
+}
+
+func TestLoad_FrontendPublicURLTrimsTrailingSlash(t *testing.T) {
+	baseLoadEnv(t)
+	t.Setenv("FRONTEND_PUBLIC_URL", "https://frontend.example.com/")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if got, want := cfg.Provider.FrontendPublicURL, "https://frontend.example.com"; got != want {
+		t.Fatalf("FrontendPublicURL = %q, want %q", got, want)
+	}
+}
+
 func TestLoad_LegacyMockPaymentBaseURLRemainsCompatible(t *testing.T) {
 	baseLoadEnv(t)
 	t.Setenv("FRONTEND_PUBLIC_URL", "")

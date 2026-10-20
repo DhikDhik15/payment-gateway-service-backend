@@ -710,8 +710,14 @@ func resolveFrontendPublicURL(providerName string) (string, error) {
 
 	raw = strings.TrimRight(raw, "/")
 	parsed, err := url.ParseRequestURI(raw)
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+	if err != nil || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
 		return "", fmt.Errorf("FRONTEND_PUBLIC_URL must be an absolute URL without userinfo, query, or fragment")
+	}
+	// The frontend opens payment_url only when it is an HTTP(S) URL. Reject
+	// other schemes at startup instead of emitting a capability the browser
+	// will refuse to open.
+	if !strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https") {
+		return "", fmt.Errorf("FRONTEND_PUBLIC_URL must use http or https")
 	}
 	return raw, nil
 }

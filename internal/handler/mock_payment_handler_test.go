@@ -2,7 +2,6 @@ package handler
 
 import (
 	"context"
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -82,9 +81,101 @@ func TestMockPaymentPublicReadAndTransition(t *testing.T) {
 		t.Fatalf("duplicate success code=%d calls=%d", w.Code, wh.calls)
 	}
 }
-func TestMockPaymentPublicUnknown(t *testing.T) {
-	if !errors.Is(repository.ErrMockPaymentNotFound, repository.ErrMockPaymentNotFound) {
-		t.Fatal("sentinel")
+func TestMockPaymentPublicUnknownIdentifier(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := &mockPublicStore{p: &model.MockPayment{
+		PublicID:              "MOCK-TXN-known",
+		ProviderTransactionID: "MOCK-TXN-known",
+		Status:                model.TransactionStatusPending,
+		ExpiredAt:             time.Now().Add(time.Hour),
+	}}
+	h := NewMockPaymentHandler(store, &mockPublicWebhook{}, "secret")
+	r := gin.New()
+	r.GET("/api/v1/mock-payments/:identifier", h.Get)
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/v1/mock-payments/MOCK-TXN-unknown", nil))
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("unknown identifier status = %d, want %d", w.Code, http.StatusNotFound)
+	}
+	if body := w.Body.String(); !contains(body, `"code":"TRANSACTION_NOT_FOUND"`) {
+		t.Fatalf("unknown identifier body = %s, want TRANSACTION_NOT_FOUND", body)
+	}
+}
+
+func TestMockPaymentPublicResponseSchema(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	expiresAt := time.Now().UTC().Add(45 * time.Minute).Truncate(time.Second)
+	p := &model.MockPayment{
+		PublicID:              "MOCK-TXN-schema",
+		ProviderTransactionID: "MOCK-TXN-schema",
+		GatewayTransactionID:  "gateway-internal-id",
+		MerchantOrderID:       "ORDER-SCHEMA",
+		Amount:                75000,
+		Currency:              "IDR",
+		PaymentMethod:         "QRIS",
+		Status:                model.TransactionStatusPending,
+		ExpiredAt:             expiresAt,
+	}
+	h := NewMockPaymentHandler(&mockPublicStore{p: p}, &mockPublicWebhook{}, "secret")
+	r := gin.New()
+	r.GET("/api/v1/mock-payments/:identifier", h.Get)
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/v1/mock-payments/"+p.PublicID, nil))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	body := w.Body.String()
+	for _, want := range []string{
+		`"reference":"ORDER-SCHEMA"`,
+		`"amount":75000`,
+		`"currency":"IDR"`,
+		`"payment_method":"QRIS"`,
+		`"status":"PENDING"`,
+		`"provider_transaction_id":"MOCK-TXN-schema"`,
+		`"qris_payload":"PAYGATE-MOCK-QRIS:MOCK-TXN-schema"`,
+		`"expired_at":"` + expiresAt.Format(time.RFC3339) + `"`,
+	} {
+		if !contains(body, want) {
+			t.Fatalf("public response missing %s\nbody: %s", want, body)
+		}
+	}
+	if contains(body, "gateway-internal-id") || contains(body, "gateway_transaction_id") {
+		t.Fatalf("public response leaked gateway internals: %s", body)
+	}
+}
+
+func TestMockPaymentPublicNonQRISOmitsPayload(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	p := &model.MockPayment{
+		PublicID:              "MOCK-TXN-nonqris",
+		ProviderTransactionID: "MOCK-TXN-nonqris",
+		MerchantOrderID:       "ORDER-NONQRIS",
+		Amount:                25000,
+		Currency:              "IDR",
+		PaymentMethod:         "BANK_TRANSFER",
+		Status:                model.TransactionStatusPaid,
+		ExpiredAt:             time.Now().UTC().Add(time.Hour),
+	}
+	h := NewMockPaymentHandler(&mockPublicStore{p: p}, &mockPublicWebhook{}, "secret")
+	r := gin.New()
+	r.GET("/api/v1/mock-payments/:identifier", h.Get)
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/v1/mock-payments/"+p.PublicID, nil))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	body := w.Body.String()
+	if contains(body, "qris_payload") {
+		t.Fatalf("non-QRIS response must omit qris_payload: %s", body)
+	}
+	if !contains(body, `"status":"PAID"`) {
+		t.Fatalf("terminal status not returned: %s", body)
 	}
 }
 func contains(s, sub string) bool {

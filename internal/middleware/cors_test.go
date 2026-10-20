@@ -144,3 +144,50 @@ func TestCORS(t *testing.T) {
 		}
 	})
 }
+
+func TestCORS_PreflightCredentialsAndDisallowedOrigin(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(middleware.CORS("http://localhost:5173"))
+	r.POST("/api/v1/auth/refresh", func(c *gin.Context) {
+		c.Status(http.StatusOK)
+	})
+
+	t.Run("allowed preflight advertises credentials", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodOptions, "/api/v1/auth/refresh", nil)
+		req.Header.Set("Origin", "http://localhost:5173")
+		req.Header.Set("Access-Control-Request-Method", http.MethodPost)
+		w := httptest.NewRecorder()
+
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusNoContent {
+			t.Fatalf("status = %d, want %d", w.Code, http.StatusNoContent)
+		}
+		if got := w.Header().Get("Access-Control-Allow-Origin"); got != "http://localhost:5173" {
+			t.Fatalf("Access-Control-Allow-Origin = %q", got)
+		}
+		if got := w.Header().Get("Access-Control-Allow-Credentials"); got != "true" {
+			t.Fatalf("Access-Control-Allow-Credentials = %q, want true", got)
+		}
+	})
+
+	t.Run("disallowed preflight gets no CORS grant", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodOptions, "/api/v1/auth/refresh", nil)
+		req.Header.Set("Origin", "http://malicious.example")
+		req.Header.Set("Access-Control-Request-Method", http.MethodPost)
+		w := httptest.NewRecorder()
+
+		r.ServeHTTP(w, req)
+
+		if w.Code == http.StatusNoContent {
+			t.Fatalf("disallowed preflight must not be short-circuited with 204")
+		}
+		if got := w.Header().Get("Access-Control-Allow-Origin"); got != "" {
+			t.Fatalf("Access-Control-Allow-Origin = %q, want empty", got)
+		}
+		if got := w.Header().Get("Access-Control-Allow-Credentials"); got != "" {
+			t.Fatalf("Access-Control-Allow-Credentials = %q, want empty", got)
+		}
+	})
+}
